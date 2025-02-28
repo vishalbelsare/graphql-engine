@@ -1,16 +1,22 @@
-import pytest
 from ruamel.yaml import YAML
-from validate import check_query_f, check_query
+import pytest
+
+from conftest import extract_server_address_from
 from remote_server import NodeGraphQL
+from validate import check_query_f, check_query
 
 yaml=YAML(typ='safe', pure=True)
 
-@pytest.fixture(scope="module")
-def graphql_service():
-    svc = NodeGraphQL(["node", "remote_schemas/nodejs/index.js"])
-    svc.start()
-    yield svc
-    svc.stop()
+@pytest.fixture(scope='class')
+@pytest.mark.early
+def graphql_service(worker_id: str, hge_fixture_env: dict[str, str]):
+    (_, port) = extract_server_address_from('GRAPHQL_SERVICE_HANDLER')
+    server = NodeGraphQL(worker_id, 'remote_schemas/nodejs/index.js', port=port)
+    server.start()
+    print(f'{graphql_service.__name__} server started on {server.url}')
+    hge_fixture_env['GRAPHQL_SERVICE_HANDLER'] = server.url
+    yield server
+    server.stop()
 
 @pytest.mark.usefixtures('per_class_tests_db_state')
 class TestGraphqlIntrospection:
@@ -38,6 +44,13 @@ class TestGraphqlIntrospection:
 
     def test_introspection_user(self, hge_ctx):
         check_query_f(hge_ctx, self.dir() + "/introspection_user_role.yaml")
+
+    def test_introspection_directive_is_repeatable(self, hge_ctx):
+        with open(self.dir() + "/introspection_directive_is_repeatable.yaml") as c:
+            conf = yaml.load(c)
+        resp, _ = check_query(hge_ctx, conf)
+        for t in resp['data']['__schema']['directives']:
+            assert t['isRepeatable'] == False
 
     @classmethod
     def dir(cls):
@@ -83,6 +96,8 @@ class TestGraphqlIntrospectionWithCustomTableName:
         hasAggregate = False
         hasSelectByPk = False
         hasQueryRoot = False
+        hasMultiInsert = False
+        hasUpdateByPk = False
         for t in resp['data']['__schema']['types']:
             if t['name'] == 'query_root':
                 hasQueryRoot = True
@@ -128,7 +143,8 @@ class TestGraphqlIntrospectionWithCustomTableName:
     def dir(cls):
         return "queries/graphql_introspection/custom_table_name"
 
-@pytest.mark.usefixtures('per_class_tests_db_state', 'pro_tests_fixtures')
+@pytest.mark.admin_secret
+@pytest.mark.usefixtures('per_class_tests_db_state', 'pro_tests_fixtures', 'enterprise_edition')
 class TestDisableGraphQLIntrospection:
 
     @classmethod

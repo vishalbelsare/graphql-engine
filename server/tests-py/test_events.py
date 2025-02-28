@@ -1,19 +1,16 @@
-#!/usr/bin/env python3
-
 import pytest
 import queue
 import time
-import json
-import utils
+
+import fixtures.postgres
+from context import EvtsWebhookServer, HGECtx
 from utils import *
-from validate import check_query, check_query_f, check_event, check_event_transformed, check_events
+from validate import check_query_f, check_event, check_event_transformed, check_events
 
 usefixtures = pytest.mark.usefixtures
 
 # Every test in this class requires the events webhook to be running first
-# We are also going to mark as server upgrade tests are allowed
-# A few tests are going to be excluded with skip_server_upgrade_test mark
-pytestmark = [usefixtures('evts_webhook'), pytest.mark.allow_server_upgrade_test]
+pytestmark = usefixtures('evts_webhook')
 
 def select_last_event_fromdb(hge_ctx):
     q = {
@@ -117,8 +114,6 @@ class TestEventCreateAndDelete:
     def test_create_reset(self, hge_ctx):
         check_query_f(hge_ctx, self.dir() + "/create_and_reset.yaml")
 
-    # Can't run server upgrade tests, as this test has a schema change
-    @pytest.mark.skip_server_upgrade_test
     def test_create_operation_spec_not_provider_err(self, hge_ctx):
         check_query_f(hge_ctx, self.dir() + "/create_trigger_operation_specs_not_provided_err.yaml")
 
@@ -129,13 +124,51 @@ class TestEventCreateAndDelete:
 @usefixtures("per_method_tests_db_state")
 class TestEventCreateAndResetNonDefaultSource:
 
-    def test_create_reset_non_default_source(self, hge_ctx):
+    @pytest.fixture(scope='class', autouse=True)
+    def another_source(self, owner_engine, add_source):
+        backend: fixtures.postgres.Backend = add_source('postgres')
+        backend_database = backend.engine.url.database
+        assert backend_database is not None
+
+        with fixtures.postgres.switch_schema(owner_engine, backend_database).connect() as connection:
+            connection.execute('DROP SCHEMA IF EXISTS hge_tests CASCADE')
+        with backend.engine.connect() as connection:
+            connection.execute('CREATE SCHEMA hge_tests')
+
+        yield backend
+
+        # TODO: remove once parallelization work is completed
+        #       cleanup will no longer be required
+        with backend.engine.connect() as connection:
+            connection.execute('DROP SCHEMA IF EXISTS hge_tests CASCADE')
+
+    def test_create_reset_non_default_source(self, hge_ctx, another_source):
         check_query_f(hge_ctx, self.dir() + "/create_and_reset_non_default_source.yaml")
+
+        with another_source.engine.connect() as connection:
+            # Check that the event log table exists.
+            # This must be run against the source database.
+            result = connection.execute("SELECT EXISTS (SELECT * FROM information_schema.tables WHERE table_schema = 'hdb_catalog' and table_name = 'event_log')")
+            row = result.first()
+            assert row == (True,), f'Result: {row!r}'
+
+            # We plan on clearing the metadata in code in the future, so this is not run as YAML input.
+            hge_ctx.v1metadataq({
+                "type": "clear_metadata",
+                "args": {}
+            })
+
+            # Check that the event log table has been dropped.
+            # This must be run against the source database.
+            result = connection.execute("SELECT EXISTS (SELECT * FROM information_schema.tables WHERE table_schema = 'hdb_catalog' and table_name = 'event_log')")
+            row = result.first()
+            assert row == (False,), f'Result: {row!r}'
 
     @classmethod
     def dir(cls):
         return 'queries/event_triggers/create_and_reset_non_default'
-@pytest.mark.parametrize("backend", ['mssql'])
+
+@pytest.mark.backend('mssql')
 @usefixtures("per_method_tests_db_state")
 class TestEventCreateAndDeleteMSSQL:
 
@@ -151,8 +184,6 @@ class TestEventCreateAndDeleteMSSQL:
 
         check_query_f(hge_ctx, self.dir() + "/create_and_reset_mssql_2.yaml")
 
-    # Can't run server upgrade tests, as this test has a schema change
-    @pytest.mark.skip_server_upgrade_test
     def test_create_operation_spec_not_provider_err(self, hge_ctx):
         check_query_f(hge_ctx, self.dir() + "/create_trigger_operation_specs_not_provided_err_mssql.yaml")
 
@@ -165,11 +196,11 @@ class TestEventCreateAndDeleteMSSQL:
 # - checks that we're processing with the concurrency and backpressure
 #   characteristics we expect
 # - ensures all events are successfully processed
-#
-# NOTE: this expects:
-#   HASURA_GRAPHQL_EVENTS_HTTP_POOL_SIZE=8
-#   HASURA_GRAPHQL_EVENTS_FETCH_BATCH_SIZE=100  (the default)
-@pytest.mark.parametrize("backend", ['mssql','postgres'])
+@pytest.mark.backend('mssql', 'postgres')
+# Set a known batch size for assertions.
+@pytest.mark.hge_env('HASURA_GRAPHQL_EVENTS_FETCH_BATCH_SIZE', str(100))
+# Set the HTTP pool size to trigger backpressure upon flooding.
+@pytest.mark.hge_env('HASURA_GRAPHQL_EVENTS_HTTP_POOL_SIZE', str(8))
 @usefixtures("per_method_tests_db_state")
 class TestEventFloodPostgresMSSQL(object):
 
@@ -177,7 +208,7 @@ class TestEventFloodPostgresMSSQL(object):
     def dir(cls):
         return 'queries/event_triggers/flood'
 
-    def test_flood(self, hge_ctx, evts_webhook):
+    def test_flood(self, hge_ctx: HGECtx, evts_webhook: EvtsWebhookServer):
         table = {"schema": "hge_tests", "name": "test_flood"}
 
         # Trigger a bunch of events; hasura will begin processing but block on /block
@@ -240,7 +271,7 @@ class TestEventFloodPostgresMSSQL(object):
                 assert resp['result'][1][0] == 200
 
         # Rather than sleep arbitrarily, loop until assertions pass:
-        utils.until_asserts_pass(30, check_backpressure)
+        until_asserts_pass(30, check_backpressure)
         # ...then make sure we're truly stable:
         time.sleep(3)
         check_backpressure()
@@ -259,7 +290,7 @@ class TestEventFloodPostgresMSSQL(object):
         ns.sort()
         assert ns == list(payload)
 
-@usefixtures("per_class_tests_db_state")
+@usefixtures('postgis', 'per_class_tests_db_state')
 class TestEventDataFormat(object):
 
     @classmethod
@@ -320,7 +351,7 @@ class TestEventDataFormat(object):
       update(hge_ctx, table, where_exp, set_exp)
       check_event(hge_ctx, evts_webhook, "geojson_all", table, "UPDATE", exp_ev_data)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures("per_class_tests_db_state")
 class TestEventDataFormatBigIntMSSQL(object):
 
@@ -356,7 +387,7 @@ class TestEventDataFormatBigIntMSSQL(object):
       print("----------- resp ----------\n", resp)
       check_event(hge_ctx, evts_webhook, "bigint_all", table, "INSERT", exp_ev_data)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures("per_class_tests_db_state")
 class TestEventDataFormatGeoJSONMSSQL(object):
 
@@ -367,7 +398,7 @@ class TestEventDataFormatGeoJSONMSSQL(object):
     def test_geojson(self, hge_ctx, evts_webhook):
       check_query_f(hge_ctx, self.dir() + '/create_geojson_event_trigger.yaml')
 
-@pytest.mark.parametrize("backend", ['mssql','postgres'])
+@pytest.mark.backend('mssql','postgres')
 @usefixtures("per_class_tests_db_state")
 class TestCreateEventQueryPostgresMSSQL(object):
 
@@ -423,26 +454,29 @@ class TestCreateEventQueryPostgresMSSQL(object):
 
         check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data)
 
+@pytest.mark.backend('postgres')
+@usefixtures("per_class_tests_db_state")
+class TestCreateEventQueryPostgres(object):
+
+    @classmethod
+    def dir(cls):
+        return 'queries/event_triggers/basic'
 
     def test_partitioned_table_basic_insert(self, hge_ctx, evts_webhook):
-        if (hge_ctx.backend == "postgres"):
-            if hge_ctx.pg_version < 110000:
-                pytest.skip('Event triggers on partioned tables are not supported in Postgres versions < 11')
-                return
-            hge_ctx.v1q_f(self.dir() + '/partition_table_setup.yaml')
-            table = { "schema":"hge_tests", "name": "measurement"}
+        hge_ctx.v1q_f(self.dir() + '/partition_table_setup.yaml')
+        table = { "schema":"hge_tests", "name": "measurement"}
 
-            init_row = { "city_id": 1, "logdate": "2006-02-02", "peaktemp": 1, "unitsales": 1}
+        init_row = { "city_id": 1, "logdate": "2006-02-02", "peaktemp": 1, "unitsales": 1}
 
-            exp_ev_data = {
-                "old": None,
-                "new": init_row
-            }
-            insert(hge_ctx, table, init_row)
-            check_event(hge_ctx, evts_webhook, "measurement_all", table, "INSERT", exp_ev_data)
-            hge_ctx.v1q_f(self.dir() + '/partition_table_teardown.yaml')
+        exp_ev_data = {
+            "old": None,
+            "new": init_row
+        }
+        insert(hge_ctx, table, init_row)
+        check_event(hge_ctx, evts_webhook, "measurement_all", table, "INSERT", exp_ev_data)
+        hge_ctx.v1q_f(self.dir() + '/partition_table_teardown.yaml')
 
-@pytest.mark.parametrize("backend", ['mssql','postgres'])
+@pytest.mark.backend('mssql','postgres')
 @usefixtures('per_method_tests_db_state')
 class TestEventRetryConfPostgresMSSQL(object):
 
@@ -522,7 +556,8 @@ class TestEventRetryConfPostgresMSSQL(object):
         except queue.Empty:
             pass
 
-@pytest.mark.parametrize("backend", ['mssql','postgres'])
+@pytest.mark.backend('mssql', 'postgres')
+@pytest.mark.hge_env('EVENT_WEBHOOK_HEADER', 'MyEnvValue')
 @usefixtures('per_method_tests_db_state')
 class TestEventHeadersPostgresMSSQL(object):
 
@@ -567,7 +602,7 @@ class TestUpdateEventQuery(object):
         #   update:
         #     columns: ["c1", "c3"]
         resp = hge_ctx.v1q_f(self.dir() + '/update-setup.yaml')
-        assert resp[1]["sources"][0]["tables"][0]["event_triggers"][0]["webhook"] == 'http://127.0.0.1:5592/new'
+        assert resp[1]["sources"][0]["tables"][0]["event_triggers"][0]["webhook"] == '{{EVENT_WEBHOOK_HANDLER}}/new'
         yield
         resp = hge_ctx.v1q_f(self.dir() + '/teardown.yaml')
 
@@ -616,7 +651,7 @@ class TestUpdateEventQuery(object):
 
         check_event(hge_ctx, evts_webhook, "t1_cols", table, "DELETE", exp_ev_data, webhook_path = "/new")
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 class TestUpdateEventQueryMSSQL(object):
 
     @classmethod
@@ -644,7 +679,7 @@ class TestUpdateEventQueryMSSQL(object):
         sources = resp[1]["sources"]
         for source in sources:
             if source["name"] == "mssql":
-                assert source["tables"][0]["event_triggers"][0]["webhook"] == 'http://127.0.0.1:5592/new'
+                assert source["tables"][0]["event_triggers"][0]["webhook"] == '{{EVENT_WEBHOOK_HANDLER}}/new'
 
         yield
         print("--- TEARDOWN STARTED -----")
@@ -745,7 +780,7 @@ class TestDeleteEventQuery(object):
             # NOTE: use a bit of a delay here, to catch any stray events generated above
             check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data, get_timeout=2)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestDeleteEventQueryMSSQL(object):
 
@@ -831,7 +866,6 @@ class TestEventSelCols:
         delete(hge_ctx, table, where_exp)
         check_event(hge_ctx, evts_webhook, "t1_cols", table, "DELETE", exp_ev_data)
 
-    @pytest.mark.skip_server_upgrade_test
     def test_selected_cols_dep(self, hge_ctx, evts_webhook):
         resp = hge_ctx.v1q({
             "type": "run_sql",
@@ -848,7 +882,7 @@ class TestEventSelCols:
             }
         })
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_class_tests_db_state')
 class TestEventSelColsMSSQL:
 
@@ -897,7 +931,6 @@ class TestEventSelColsMSSQL:
         print("----- RESP 4 -----", resp)
         check_event(hge_ctx, evts_webhook, "t1_cols", table, "DELETE", exp_ev_data)
 
-    @pytest.mark.skip_server_upgrade_test
     def test_selected_cols_dep(self, hge_ctx, evts_webhook):
         # Dropping Primary Key is not allowed
         resp = hge_ctx.v2q({
@@ -966,7 +999,7 @@ class TestEventInsertOnly:
             # NOTE: use a bit of a delay here, to catch any stray events generated above
             check_event(hge_ctx, evts_webhook, "t1_insert", table, "DELETE", exp_ev_data, get_timeout=2)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestEventInsertOnlyMSSQL:
 
@@ -1007,7 +1040,7 @@ class TestEventInsertOnlyMSSQL:
             # NOTE: use a bit of a delay here, to catch any stray events generated above
             check_event(hge_ctx, evts_webhook, "t1_insert", table, "DELETE", exp_ev_data, get_timeout=2)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestEventUpdateOnlyMSSQL:
 
@@ -1191,7 +1224,7 @@ class TestEventSelPayload:
         }, expected_status_code = 400)
         assert resp['code'] == "dependency-error", resp
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_class_tests_db_state')
 class TestEventSelPayloadMSSQL:
 
@@ -1308,7 +1341,7 @@ class TestWebhookEvent(object):
         delete(hge_ctx, table, where_exp)
         check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestWebhookEventMSSQL(object):
 
@@ -1380,7 +1413,7 @@ class TestEventWebhookTemplateURL(object):
         delete(hge_ctx, table, where_exp)
         check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data, webhook_path = '/trigger')
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestEventWebhookTemplateURLMSSQL(object):
 
@@ -1455,7 +1488,7 @@ class TestEventSessionVariables(object):
         delete(hge_ctx, table, where_exp)
         check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestEventSessionVariablesMSSQL(object):
 
@@ -1532,7 +1565,7 @@ class TestManualEvents(object):
 
             self.test_basic(hge_ctx, evts_webhook)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures('per_method_tests_db_state')
 class TestManualEventsMSSQL(object):
 
@@ -1565,7 +1598,7 @@ class TestManualEventsMSSQL(object):
 
             self.test_basic(hge_ctx, evts_webhook)
 
-@pytest.mark.parametrize("backend", ['mssql','postgres'])
+@pytest.mark.backend('mssql','postgres')
 @usefixtures('per_method_tests_db_state')
 class TestEventsAsynchronousExecutionPostgresMSSQL(object):
 
@@ -1632,7 +1665,7 @@ class TestEventTransform(object):
                                 removedHeaders=["user-agent"],
                                 webhook_path=expectedPath)
 
-@pytest.mark.parametrize("backend", ['mssql'])
+@pytest.mark.backend('mssql')
 @usefixtures("per_method_tests_db_state")
 class TestEventTransformMSSQL(object):
 

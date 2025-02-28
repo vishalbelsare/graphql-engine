@@ -17,7 +17,7 @@ import TabItem from '@theme/TabItem';
 import Thumbnail from '@site/src/components/Thumbnail';
 import GraphiQLIDE from '@site/src/components/GraphiQLIDE';
 
-# BigQuery: Database to remote database relationships
+# BigQuery: Database to Remote Database Relationships
 
 ## Introduction
 
@@ -38,16 +38,16 @@ Remote database relationships for BigQuery are supported from versions `v2.1.0` 
 
 ## Create remote database relationships
 
-### Step 0: Add two database sources
+### Step 1: Add two database sources
 
-Add a source database as described [here](/databases/connect-db/index.mdx) and track the required tables. Then, repeat
+Add a source database as described [here](/databases/overview.mdx) and track the required tables. Then, repeat
 the process to add your target database.
 
-### Step 1: Define and create the relationship
+### Step 2: Define and create the relationship
 
 A remote database relationship is defined alongside the source database table (that is, the source side of the join).
 
-The following fields can be defined for a remote schema relationship:
+The following fields can be defined for a Remote Schema relationship:
 
 - **Relationship type**: Either `object` or `array` - similar to normal relationships. Hasura supports both many-to-one
   (object) and one-to-many (array) relationships.
@@ -60,19 +60,20 @@ The following fields can be defined for a remote schema relationship:
 For example, say we have a table `articles(id int, author_id int)` in the source database and a table
 `author(id int, name text)` in the target database.
 
-We can create an object remote database relationship `author` joining the `articles` table to the `author` table using the
-`articles.author_id` and `author.id` fields.
-<Tabs className="api-tabs">
+We can create an object remote database relationship `author` joining the `articles` table to the `author` table using
+the `articles.author_id` and `author.id` fields.
+
+<Tabs groupId="user-preference" className="api-tabs">
 <TabItem value="console" label="Console">
 
 Console support will be added soon.
 
-<!-- TODO: verify remote source relationships in the console https://github.com/hasura/graphql-engine-mono/issues/4981
+<!-- TODO: verify remote source relationships in the Console https://github.com/hasura/graphql-engine-mono/issues/4981
 
 Head to the `Data > [database] > [articles] > Relationships` tab. Under the `Remote Database Relationships` section,
 select `Add a remote database relationship`.
 <Thumbnail
-  src='/img/graphql/core/databases/postgres/schema/create-remote-source-relationship.png'
+  src='/img/databases/postgres/schema/create-remote-source-relationship.png'
   alt='Create remote database relationships'
 />
 
@@ -89,16 +90,16 @@ table:
   dataset: source
   name: author
 remote_relationships:
-- name: articles
-  definition:
-    to_source:
-      field_mapping:
-        id: author_id
-      relationship_type: array
-      source: bq-target
-      table:
-        dataset: target
-        name: articles
+  - name: articles
+    definition:
+      to_source:
+        field_mapping:
+          id: author_id
+        relationship_type: array
+        source: bq-target
+        table:
+          dataset: target
+          name: articles
 ```
 
 Apply the metadata:
@@ -114,7 +115,7 @@ You can add a remote database relationship by using the
 [bigquery_create_remote_relationship](/api-reference/metadata-api/remote-relationships.mdx#metadata-bigquery-create-remote-relationship)
 or
 [bigquery_update_remote_relationship](/api-reference/metadata-api/remote-relationships.mdx#metadata-bigquery-update-remote-relationship)
-metadata APIs with the `to_source` field.
+Metadata APIs with the `to_source` field.
 
 ```http
 POST /v1/metadata HTTP/1.1
@@ -151,7 +152,7 @@ X-Hasura-Role: admin
 </TabItem>
 </Tabs>
 
-### Step 2: Explore with GraphiQL
+### Step 3: Explore with GraphiQL
 
 Run the following query in the GraphiQL editor to test your remote database relationship across the two connected
 databases:

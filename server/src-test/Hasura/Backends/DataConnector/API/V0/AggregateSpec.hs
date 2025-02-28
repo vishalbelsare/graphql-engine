@@ -4,16 +4,20 @@
 module Hasura.Backends.DataConnector.API.V0.AggregateSpec
   ( spec,
     genAggregate,
+    genSingleColumnAggregate,
   )
 where
 
 import Data.Aeson.QQ.Simple (aesonQQ)
 import Hasura.Backends.DataConnector.API.V0
 import Hasura.Backends.DataConnector.API.V0.ColumnSpec (genColumnName)
+import Hasura.Backends.DataConnector.API.V0.ExpressionSpec (genRedactionExpressionName)
+import Hasura.Backends.DataConnector.API.V0.ScalarSpec (genScalarType)
 import Hasura.Prelude
 import Hedgehog
 import Hedgehog.Gen qualified as Gen
-import Hedgehog.Range (linear)
+import Language.GraphQL.Draft.Generator (genName)
+import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import Test.Aeson.Utils (jsonOpenApiProperties, testToFromJSONToSchema)
 import Test.Hspec
 
@@ -22,19 +26,22 @@ spec = do
   describe "Aggregate" $ do
     describe "SingleColumn" $ do
       testToFromJSONToSchema
-        (SingleColumn $ SingleColumnAggregate Average (ColumnName "my_column_name"))
+        (SingleColumn $ SingleColumnAggregate (SingleColumnAggregateFunction [G.name|avg|]) (ColumnName "my_column_name") (Just $ RedactionExpressionName "RedactionExp2") (ScalarType "number"))
         [aesonQQ|
           { "type": "single_column",
             "function": "avg",
-            "column": "my_column_name"
+            "column": "my_column_name",
+            "redaction_expression": "RedactionExp2",
+            "result_type": "number"
           }
         |]
     describe "ColumnCount" $ do
       testToFromJSONToSchema
-        (ColumnCount $ ColumnCountAggregate [ColumnName "my_column_name"] True)
+        (ColumnCount $ ColumnCountAggregate (ColumnName "my_column_name") (Just $ RedactionExpressionName "RedactionExp2") True)
         [aesonQQ|
           { "type": "column_count",
-            "columns": ["my_column_name"],
+            "column": "my_column_name",
+            "redaction_expression": "RedactionExp2",
             "distinct": true
           }
         |]
@@ -48,25 +55,10 @@ spec = do
     jsonOpenApiProperties genAggregate
 
   describe "SingleColumnAggregateFunction" $ do
-    describe "Average" $
-      testToFromJSONToSchema Average [aesonQQ|"avg"|]
-    describe "Max" $
-      testToFromJSONToSchema Max [aesonQQ|"max"|]
-    describe "Min" $
-      testToFromJSONToSchema Min [aesonQQ|"min"|]
-    describe "StandardDeviationPopulation" $
-      testToFromJSONToSchema StandardDeviationPopulation [aesonQQ|"stddev_pop"|]
-    describe "StandardDeviationSample" $
-      testToFromJSONToSchema StandardDeviationSample [aesonQQ|"stddev_samp"|]
-    describe "Sum" $
-      testToFromJSONToSchema Sum [aesonQQ|"sum"|]
-    describe "VariancePopulation" $
-      testToFromJSONToSchema VariancePopulation [aesonQQ|"var_pop"|]
-    describe "VarianceSample" $
-      testToFromJSONToSchema VarianceSample [aesonQQ|"var_samp"|]
+    testToFromJSONToSchema (SingleColumnAggregateFunction [G.name|avg|]) [aesonQQ|"avg"|]
     jsonOpenApiProperties genSingleColumnAggregateFunction
 
-genAggregate :: MonadGen m => m Aggregate
+genAggregate :: Gen Aggregate
 genAggregate =
   Gen.choice
     [ SingleColumn <$> genSingleColumnAggregate,
@@ -74,17 +66,20 @@ genAggregate =
       pure StarCount
     ]
 
-genSingleColumnAggregate :: MonadGen m => m SingleColumnAggregate
+genSingleColumnAggregate :: Gen SingleColumnAggregate
 genSingleColumnAggregate =
   SingleColumnAggregate
     <$> genSingleColumnAggregateFunction
     <*> genColumnName
+    <*> Gen.maybe genRedactionExpressionName
+    <*> genScalarType
 
-genColumnCountAggregate :: MonadGen m => m ColumnCountAggregate
+genColumnCountAggregate :: Gen ColumnCountAggregate
 genColumnCountAggregate =
   ColumnCountAggregate
-    <$> Gen.nonEmpty (linear 0 5) genColumnName
+    <$> genColumnName
+    <*> Gen.maybe genRedactionExpressionName
     <*> Gen.bool
 
-genSingleColumnAggregateFunction :: MonadGen m => m SingleColumnAggregateFunction
-genSingleColumnAggregateFunction = Gen.enumBounded
+genSingleColumnAggregateFunction :: Gen SingleColumnAggregateFunction
+genSingleColumnAggregateFunction = SingleColumnAggregateFunction <$> genName

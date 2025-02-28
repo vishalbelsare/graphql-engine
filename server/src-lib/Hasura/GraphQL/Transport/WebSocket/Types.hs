@@ -3,7 +3,7 @@ module Hasura.GraphQL.Transport.WebSocket.Types
     WSConn,
     WSConnData (WSConnData, _wscOpMap, _wscUser),
     WSConnState (CSInitError, CSInitialised, CSNotInitialised),
-    WSServerEnv (WSServerEnv, _wseCorsPolicy, _wseHManager, _wseKeepAliveDelay, _wseSubscriptionState, _wseLogger, _wseServer, _wseServerMetrics),
+    WSServerEnv (..),
     WsClientState (WsClientState, wscsIpAddress, wscsReqHeaders, wscsTokenExpTime, wscsUserInfo),
     WsHeaders (WsHeaders, unWsHeaders),
     SubscriberType (..),
@@ -12,6 +12,7 @@ where
 
 import Control.Concurrent.STM qualified as STM
 import Data.Time.Clock qualified as TC
+import Hasura.Authentication.User (UserInfo)
 import Hasura.GraphQL.Execute qualified as E
 import Hasura.GraphQL.Execute.Subscription.State qualified as ES
 import Hasura.GraphQL.Transport.HTTP.Protocol
@@ -20,13 +21,14 @@ import Hasura.GraphQL.Transport.WebSocket.Protocol
 import Hasura.GraphQL.Transport.WebSocket.Server qualified as WS
 import Hasura.Logging qualified as L
 import Hasura.Prelude
-import Hasura.RQL.Types.Common
-import Hasura.RQL.Types.SchemaCache
+import Hasura.Server.AppStateRef
 import Hasura.Server.Cors
 import Hasura.Server.Init.Config (KeepAliveDelay (..))
+import Hasura.Server.Logging (LoggingSettings (..))
 import Hasura.Server.Metrics (ServerMetrics (..))
+import Hasura.Server.Prometheus (PrometheusMetrics (..))
 import Hasura.Server.Types (ReadOnlyMode (..))
-import Hasura.Session
+import Hasura.Tracing qualified as Tracing
 import Network.HTTP.Client qualified as HTTP
 import Network.HTTP.Types qualified as HTTP
 import Network.Wai.Extended qualified as Wai
@@ -70,24 +72,24 @@ data WSConnData = WSConnData
     _wscAPIType :: !E.GraphQLQueryType
   }
 
-data WSServerEnv = WSServerEnv
+data WSServerEnv impl = WSServerEnv
   { _wseLogger :: !(L.Logger L.Hasura),
     _wseSubscriptionState :: !ES.SubscriptionsState,
-    -- | an action that always returns the latest version of the schema cache. See 'SchemaCacheRef'.
-    _wseGCtxMap :: !(IO (SchemaCache, SchemaCacheVer)),
+    _wseAppStateRef :: AppStateRef impl,
     _wseHManager :: !HTTP.Manager,
-    _wseCorsPolicy :: !CorsPolicy,
-    _wseSQLCtx :: !SQLGenCtx,
+    _wseCorsPolicy :: IO CorsPolicy,
     _wseReadOnlyMode :: ReadOnlyMode,
     _wseServer :: !WSServer,
-    _wseEnableAllowlist :: !Bool,
     _wseKeepAliveDelay :: !KeepAliveDelay,
-    _wseServerMetrics :: !ServerMetrics
+    _wseServerMetrics :: !ServerMetrics,
+    _wsePrometheusMetrics :: !PrometheusMetrics,
+    _wseTraceSamplingPolicy :: !Tracing.SamplingPolicy,
+    _wseLoggingSettings :: !LoggingSettings
   }
 
 data SubscriberType
-  = LiveQuerySubscriber !ES.LiveQuerySubscriberDetails
-  | StreamingQuerySubscriber !ES.StreamingSubscriberDetails
+  = LiveQuerySubscriber !ES.SubscriberDetails
+  | StreamingQuerySubscriber !ES.SubscriberDetails
 
 type OperationMap =
   STMMap.Map OperationId (SubscriberType, Maybe OperationName)

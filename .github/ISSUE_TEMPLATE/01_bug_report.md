@@ -1,6 +1,6 @@
 ---
-name: 🐜 Bug report
-about: If something isn't working 🔧
+name: 🐜 Bug report (V2)
+about: If something isn't working for Hasura, for version 2.x only 🔧
 labels: "k/bug"
 ---
 
@@ -41,15 +41,7 @@ CLI Version (for CLI related issue):
 
 <!-- Provide your answer here. -->
 
-### Any possible solutions?
-
-<!-- Provide your answer here. -->
-
-### Can you identify the location in the source code where the problem exists?
-
-<!-- Provide your answer here. -->
-
-### If the bug is confirmed, would you be willing to submit a PR?
+### Any possible solutions/workarounds you're aware of?
 
 <!-- Provide your answer here. -->
 

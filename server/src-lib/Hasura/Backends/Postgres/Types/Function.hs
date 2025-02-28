@@ -12,21 +12,18 @@ where
 
 import Data.Aeson
 import Hasura.Backends.Postgres.SQL.Types
-import Hasura.Incremental (Cacheable)
+import Hasura.Function.Cache
 import Hasura.Prelude
-import Hasura.RQL.Types.Function
 
 newtype HasDefault = HasDefault {unHasDefault :: Bool}
-  deriving (Show, Eq, Generic, ToJSON, Cacheable, NFData, Hashable)
+  deriving (Show, Eq, Ord, Generic, ToJSON, NFData, Hashable)
 
 data FunctionArg = FunctionArg
   { faName :: Maybe FunctionArgName,
     faType :: QualifiedPGType,
     faHasDefault :: HasDefault
   }
-  deriving (Show, Eq, Generic)
-
-instance Cacheable FunctionArg
+  deriving (Show, Eq, Ord, Generic)
 
 instance NFData FunctionArg
 
@@ -48,6 +45,8 @@ data ArgumentExp a
   deriving stock (Eq, Show, Functor, Foldable, Traversable, Generic)
 
 instance (Hashable a) => Hashable (ArgumentExp a)
+
+instance (NFData a) => NFData (ArgumentExp a)
 
 -- | Eliminate 'ArgumentExp'
 --

@@ -1,6 +1,9 @@
+{-# LANGUAGE UndecidableInstances #-}
+
 module Database.MSSQL.Transaction
   ( TxET (..),
     MSSQLTxError (..),
+    TxIsolation (..),
     TxT,
     TxE,
     runTx,
@@ -17,9 +20,13 @@ module Database.MSSQL.Transaction
   )
 where
 
+import Autodocodec (HasCodec (codec), bimapCodec, textCodec, (<?>))
+import Autodocodec.Aeson qualified as AC
 import Control.Exception (try)
 import Control.Monad.Morph (MFunctor (hoist))
 import Control.Monad.Trans.Control (MonadBaseControl)
+import Data.Aeson qualified as J
+import Data.Text qualified as T
 import Database.MSSQL.Pool
 import Database.ODBC.SQLServer (FromRow)
 import Database.ODBC.SQLServer qualified as ODBC
@@ -48,6 +55,10 @@ instance MFunctor (TxET e) where
 instance MonadTrans (TxET e) where
   lift = TxET . lift . lift
 
+deriving via (ReaderT ODBC.Connection (ExceptT e m)) instance (MonadBase IO m) => MonadBase IO (TxET e m)
+
+deriving via (ReaderT ODBC.Connection (ExceptT e m)) instance (MonadBaseControl IO m) => MonadBaseControl IO (TxET e m)
+
 -- | Error type generally used in 'TxET'.
 data MSSQLTxError
   = MSSQLQueryError !ODBC.Query !ODBC.ODBCException
@@ -65,6 +76,7 @@ type TxT m a = TxET MSSQLTxError m a
 -- See 'runTxE' if you need to map the error type as well.
 runTx ::
   (MonadIO m, MonadBaseControl IO m) =>
+  TxIsolation ->
   TxT m a ->
   MSSQLPool ->
   ExceptT MSSQLTxError m a
@@ -74,12 +86,14 @@ runTx = runTxE id
 runTxE ::
   (MonadIO m, MonadBaseControl IO m) =>
   (MSSQLTxError -> e) ->
+  TxIsolation ->
   TxET e m a ->
   MSSQLPool ->
   ExceptT e m a
-runTxE ef tx pool = do
-  withMSSQLPool pool (asTransaction ef (`execTx` tx))
-    >>= hoistEither . mapLeft (ef . MSSQLConnError)
+runTxE ef txIsolation tx pool = do
+  withMSSQLPool pool (asTransaction ef txIsolation (`execTx` tx))
+    >>= hoistEither
+    . mapLeft (ef . MSSQLConnError)
 
 -- | Useful for building transactions which return no data.
 --
@@ -131,7 +145,7 @@ singleRowQueryE ef = rawQueryE ef singleRowResult
 -- This function simply concatenates each single-column row into one long 'Text' string.
 forJsonQueryE ::
   forall m e.
-  MonadIO m =>
+  (MonadIO m) =>
   (MSSQLTxError -> e) ->
   ODBC.Query ->
   TxET e m Text
@@ -181,7 +195,7 @@ buildGenericQueryTxE errorF query convertQ runQuery =
   TxET $ ReaderT $ withExceptT errorF . execQuery query convertQ . runQuery
 
 -- | Map the error type for a 'TxET'.
-withTxET :: Monad m => (e1 -> e2) -> TxET e1 m a -> TxET e2 m a
+withTxET :: (Monad m) => (e1 -> e2) -> TxET e1 m a -> TxET e2 m a
 withTxET f (TxET m) = TxET $ hoist (withExceptT f) m
 
 -- | A successful result from a query is a list of rows where each row contains
@@ -203,9 +217,9 @@ rawQueryE ::
   TxET e m a
 rawQueryE ef rf q = do
   rows <- buildGenericQueryTxE ef q id ODBC.query
-  liftEither $
-    mapLeft (ef . MSSQLQueryError q . ODBC.DataRetrievalError) $
-      rf (MSSQLResult rows)
+  liftEither
+    $ mapLeft (ef . MSSQLQueryError q . ODBC.DataRetrievalError)
+    $ rf (MSSQLResult rows)
 
 -- | Combinator for abstracting over the query type and ensuring we catch exceptions.
 --
@@ -239,21 +253,80 @@ data TransactionState
     -- rollback of the transaction.
     TSUncommittable
 
+-- | <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-transaction-isolation-level-transact-sql>
+data TxIsolation
+  = ReadUncommitted
+  | ReadCommitted
+  | RepeatableRead
+  | Snapshot
+  | Serializable
+  deriving (Eq, Generic)
+
+instance Show TxIsolation where
+  show = \case
+    ReadUncommitted -> "READ UNCOMMITTED"
+    ReadCommitted -> "READ COMMITTED"
+    RepeatableRead -> "REPEATABLE READ"
+    Snapshot -> "SNAPSHOT"
+    Serializable -> "SERIALIZABLE"
+
+instance Hashable TxIsolation
+
+instance NFData TxIsolation
+
+instance HasCodec TxIsolation where
+  codec =
+    bimapCodec
+      decode
+      encode
+      textCodec
+      <?> "Isolation level"
+    where
+      decode :: Text -> Either String TxIsolation
+      decode = \case
+        "read-uncommitted" -> Right ReadUncommitted
+        "read-committed" -> Right ReadCommitted
+        "repeatable-read" -> Right RepeatableRead
+        "snapshot" -> Right Snapshot
+        "serializable" -> Right Serializable
+        _ ->
+          Left
+            $ T.unpack
+            $ "Unexpected options for isolation_level. Expected "
+            <> "'read-uncommited' | 'read-committed' | 'repeatable-read' | 'snapshot' | 'serializable'"
+      encode :: TxIsolation -> Text
+      encode = \case
+        ReadUncommitted -> "read-uncommitted"
+        ReadCommitted -> "read-committed"
+        RepeatableRead -> "repeatable-read"
+        Snapshot -> "snapshot"
+        Serializable -> "serializable"
+
+instance J.ToJSON TxIsolation where
+  toJSON = AC.toJSONViaCodec
+  toEncoding = AC.toEncodingViaCodec
+
+instance J.FromJSON TxIsolation where
+  parseJSON = AC.parseJSONViaCodec
+
 -- | Wraps an action in a transaction. Rolls back on errors.
 asTransaction ::
   forall e a m.
-  MonadIO m =>
+  (MonadIO m) =>
   (MSSQLTxError -> e) ->
+  TxIsolation ->
   (ODBC.Connection -> ExceptT e m a) ->
   ODBC.Connection ->
   ExceptT e m a
-asTransaction ef action conn = do
+asTransaction ef txIsolation action conn = do
   -- Begin the transaction. If there is an error, do not rollback.
-  withExceptT ef $ execTx conn beginTx
+  withExceptT ef $ execTx conn $ setTxIsoLevelTx txIsolation >> beginTx
   -- Run the transaction and commit. If there is an error, rollback.
   flip catchError rollbackAndThrow do
     result <- action conn
-    withExceptT ef $ execTx conn commitTx
+    -- After running the transaction, set the transaction isolation level
+    -- to the default isolation level i.e. Read Committed
+    withExceptT ef $ execTx conn $ commitTx >> setTxIsoLevelTx ReadCommitted
     pure result
   where
     -- Rollback and throw error.
@@ -262,10 +335,14 @@ asTransaction ef action conn = do
       withExceptT ef $ execTx conn rollbackTx
       throwError err
 
-beginTx :: MonadIO m => TxT m ()
+beginTx :: (MonadIO m) => TxT m ()
 beginTx = unitQuery "BEGIN TRANSACTION"
 
-commitTx :: MonadIO m => TxT m ()
+setTxIsoLevelTx :: (MonadIO m) => TxIsolation -> TxT m ()
+setTxIsoLevelTx txIso =
+  unitQuery $ ODBC.rawUnescapedText $ "SET TRANSACTION ISOLATION LEVEL " <> tshow txIso <> ";"
+
+commitTx :: (MonadIO m) => TxT m ()
 commitTx =
   getTransactionState >>= \case
     TSActive ->
@@ -275,7 +352,7 @@ commitTx =
     TSNoActive ->
       throwError $ MSSQLInternal "No active transaction exist; cannot commit"
 
-rollbackTx :: MonadIO m => TxT m ()
+rollbackTx :: (MonadIO m) => TxT m ()
 rollbackTx =
   let rollback = unitQuery "ROLLBACK TRANSACTION"
    in getTransactionState >>= \case
@@ -298,6 +375,6 @@ getTransactionState =
           0 -> pure TSNoActive
           -1 -> pure TSUncommittable
           _ ->
-            throwError $
-              MSSQLQueryError query $
-                ODBC.DataRetrievalError "Unexpected value for XACT_STATE"
+            throwError
+              $ MSSQLQueryError query
+              $ ODBC.DataRetrievalError "Unexpected value for XACT_STATE"

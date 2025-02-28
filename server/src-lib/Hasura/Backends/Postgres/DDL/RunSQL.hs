@@ -14,20 +14,29 @@
 module Hasura.Backends.Postgres.DDL.RunSQL
   ( runRunSQL,
     RunSQL (..),
+    isReadOnly,
     isSchemaCacheBuildRequiredRunSQL,
+
+    -- * Export for tests
+    splitSQLStatements,
   )
 where
 
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Data.Aeson
-import Data.HashMap.Strict qualified as M
+import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
+import Data.List.NonEmpty qualified as NE
+import Data.Text qualified as T
 import Data.Text.Extended
-import Database.PG.Query qualified as Q
+import Database.PG.Query qualified as PG
+import Hasura.Authentication.User (UserInfoM (..))
 import Hasura.Backends.Postgres.Connection.MonadTx
 import Hasura.Backends.Postgres.DDL.EventTrigger
 import Hasura.Backends.Postgres.DDL.Source
-  ( ToMetadataFetchQuery,
+  ( FetchFunctionMetadata,
+    FetchTableMetadata,
+    ToMetadataFetchQuery,
     fetchFunctionMetadata,
     fetchTableMetadata,
   )
@@ -35,39 +44,35 @@ import Hasura.Backends.Postgres.Execute.Types
 import Hasura.Backends.Postgres.SQL.Types hiding (FunctionName, TableName)
 import Hasura.Base.Error
 import Hasura.EncJSON
+import Hasura.Function.Cache
 import Hasura.Prelude
 import Hasura.RQL.DDL.Schema
-import Hasura.RQL.DDL.Schema.Diff
+import Hasura.RQL.DDL.Schema.Diff qualified as Diff
 import Hasura.RQL.Types.Backend
+import Hasura.RQL.Types.BackendType
+import Hasura.RQL.Types.Column (StructuredColumnInfo (..))
 import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ComputedField
 import Hasura.RQL.Types.EventTrigger
-import Hasura.RQL.Types.Function
-import Hasura.RQL.Types.Metadata hiding
-  ( fmFunction,
-    tmComputedFields,
-    tmTable,
-  )
+import Hasura.RQL.Types.Metadata
 import Hasura.RQL.Types.Metadata.Backend
 import Hasura.RQL.Types.SchemaCache
 import Hasura.RQL.Types.SchemaCache.Build
 import Hasura.RQL.Types.SchemaCacheTypes
 import Hasura.RQL.Types.Source
-import Hasura.RQL.Types.Table
 import Hasura.SQL.AnyBackend qualified as AB
-import Hasura.SQL.Backend
-import Hasura.Server.Types
 import Hasura.Server.Utils (quoteRegex)
-import Hasura.Session
+import Hasura.Table.Cache
 import Hasura.Tracing qualified as Tracing
 import Text.Regex.TDFA qualified as TDFA
 
 data RunSQL = RunSQL
   { rSql :: Text,
-    rSource :: !SourceName,
-    rCascade :: !Bool,
-    rCheckMetadataConsistency :: !(Maybe Bool),
-    rTxAccessMode :: !Q.TxAccess
+    rSource :: SourceName,
+    rCascade :: Bool,
+    rCheckMetadataConsistency :: Maybe Bool,
+    rTxAccessMode :: PG.TxAccess,
+    rNoTransaction :: Bool
   }
   deriving (Show, Eq)
 
@@ -77,8 +82,9 @@ instance FromJSON RunSQL where
     rSource <- o .:? "source" .!= defaultSource
     rCascade <- o .:? "cascade" .!= False
     rCheckMetadataConsistency <- o .:? "check_metadata_consistency"
-    isReadOnly <- o .:? "read_only" .!= False
-    let rTxAccessMode = if isReadOnly then Q.ReadOnly else Q.ReadWrite
+    readOnly <- o .:? "read_only" .!= False
+    rNoTransaction <- o .:? "no_transaction" .!= False
+    let rTxAccessMode = if readOnly then PG.ReadOnly else PG.ReadWrite
     pure RunSQL {..}
 
 instance ToJSON RunSQL where
@@ -90,8 +96,9 @@ instance ToJSON RunSQL where
         "check_metadata_consistency" .= rCheckMetadataConsistency,
         "read_only"
           .= case rTxAccessMode of
-            Q.ReadOnly -> True
-            Q.ReadWrite -> False
+            PG.ReadOnly -> True
+            PG.ReadWrite -> False,
+        "no_transaction" .= rNoTransaction
       ]
 
 -- | Check for known schema-mutating keywords in the raw SQL text.
@@ -100,8 +107,8 @@ instance ToJSON RunSQL where
 isSchemaCacheBuildRequiredRunSQL :: RunSQL -> Bool
 isSchemaCacheBuildRequiredRunSQL RunSQL {..} =
   case rTxAccessMode of
-    Q.ReadOnly -> False
-    Q.ReadWrite -> fromMaybe (containsDDLKeyword rSql) rCheckMetadataConsistency
+    PG.ReadOnly -> False
+    PG.ReadWrite -> fromMaybe (containsDDLKeyword rSql) rCheckMetadataConsistency
   where
     containsDDLKeyword =
       TDFA.match
@@ -116,6 +123,12 @@ isSchemaCacheBuildRequiredRunSQL RunSQL {..} =
                 }
               "\\balter\\b|\\bdrop\\b|\\breplace\\b|\\bcreate function\\b|\\bcomment on\\b"
           )
+
+isReadOnly :: RunSQL -> Bool
+isReadOnly runsql =
+  case rTxAccessMode runsql of
+    PG.ReadOnly -> True
+    PG.ReadWrite -> False
 
 {- Note [Checking metadata consistency in run_sql]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -137,43 +150,67 @@ of queries may not modify the schema at all. As a (fairly stupid) heuristic, we
 check if the query contains any keywords for DDL operations, and if not, we skip
 the metadata check as well. -}
 
--- | Fetch metadata of tracked tables/functions and build @'TableMeta'/@'FunctionMeta'
+-- | Fetch metadata of tracked tables/functions and build @'Diff.TableMeta'/@'Diff.FunctionMeta'
 -- to calculate diff later in @'withMetadataCheck'.
 fetchTablesFunctionsMetadata ::
-  (ToMetadataFetchQuery pgKind, BackendMetadata ('Postgres pgKind), MonadTx m) =>
+  forall pgKind m.
+  ( ToMetadataFetchQuery pgKind,
+    FetchTableMetadata pgKind,
+    FetchFunctionMetadata pgKind,
+    BackendMetadata ('Postgres pgKind),
+    MonadTx m
+  ) =>
   TableCache ('Postgres pgKind) ->
-  [TableName ('Postgres pgKind)] ->
-  [FunctionName ('Postgres pgKind)] ->
-  m ([TableMeta ('Postgres pgKind)], [FunctionMeta ('Postgres pgKind)])
+  HS.HashSet (TableName ('Postgres pgKind)) ->
+  HS.HashSet (FunctionName ('Postgres pgKind)) ->
+  m ([Diff.TableMeta ('Postgres pgKind)], [Diff.FunctionMeta ('Postgres pgKind)])
 fetchTablesFunctionsMetadata tableCache tables functions = do
   tableMetaInfos <- fetchTableMetadata tables
-  functionMetaInfos <- fetchFunctionMetadata functions
-  pure (buildTableMeta tableMetaInfos functionMetaInfos, buildFunctionMeta functionMetaInfos)
+  functionMetaInfos <- fetchFunctionMetadata @pgKind functions
+
+  let functionMetas =
+        [ functionMeta
+          | function <- HS.toList functions,
+            functionMeta <- mkFunctionMetas functionMetaInfos function
+        ]
+  let tableMetas =
+        [ Diff.TableMeta table tableMetaInfo computedFieldInfos
+          | (table, tableMetaInfo) <- HashMap.toList tableMetaInfos,
+            let computedFieldInfos =
+                  [ computedFieldMeta
+                    | Just tableInfo <- pure (HashMap.lookup table tableCache),
+                      computedField <- getComputedFields tableInfo,
+                      computedFieldMeta <-
+                        [ Diff.ComputedFieldMeta fieldName functionMeta
+                          | let fieldName = _cfiName computedField
+                                function = _cffName $ _cfiFunction computedField,
+                            functionMeta <- mkFunctionMetas functionMetaInfos function
+                        ]
+                  ]
+        ]
+
+  pure (tableMetas, functionMetas)
   where
-    buildTableMeta tableMetaInfos functionMetaInfos =
-      flip map (M.toList tableMetaInfos) $ \(table, tableMetaInfo) ->
-        TableMeta table tableMetaInfo $
-          foldMap @Maybe (concatMap (mkComputedFieldMeta functionMetaInfos) . getComputedFields) (M.lookup table tableCache)
-
-    buildFunctionMeta functionMetaInfos =
-      concatMap (getFunctionMetas functionMetaInfos) functions
-
-    mkComputedFieldMeta functionMetaInfos computedField =
-      let function = _cffName $ _cfiFunction computedField
-       in map (ComputedFieldMeta (_cfiName computedField)) $ getFunctionMetas functionMetaInfos function
-
-    getFunctionMetas functionMetaInfos function =
-      let mkFunctionMeta rawInfo =
-            FunctionMeta (rfiOid rawInfo) function (rfiFunctionType rawInfo)
-       in foldMap @Maybe (map mkFunctionMeta) $ M.lookup function functionMetaInfos
+    mkFunctionMetas ::
+      HashMap QualifiedFunction (FunctionOverloads ('Postgres pgKind)) ->
+      QualifiedFunction ->
+      [Diff.FunctionMeta ('Postgres pgKind)]
+    mkFunctionMetas functionMetaInfos function =
+      [ Diff.FunctionMeta (rfiOid rawInfo) function (rfiFunctionType rawInfo)
+        | -- It would seem like we could feasibly detect function overloads here already,
+          -- But that is handled elsewhere.
+          Just overloads <- pure (HashMap.lookup function functionMetaInfos),
+          rawInfo <- NE.toList $ getFunctionOverloads overloads
+      ]
 
 -- | Used as an escape hatch to run raw SQL against a database.
 runRunSQL ::
   forall (pgKind :: PostgresKind) m.
   ( BackendMetadata ('Postgres pgKind),
     ToMetadataFetchQuery pgKind,
+    FetchTableMetadata pgKind,
+    FetchFunctionMetadata pgKind,
     CacheRWM m,
-    HasServerConfigCtx m,
     MetadataM m,
     MonadBaseControl IO m,
     MonadError QErr m,
@@ -181,9 +218,10 @@ runRunSQL ::
     Tracing.MonadTrace m,
     UserInfoM m
   ) =>
+  SQLGenCtx ->
   RunSQL ->
   m EncJSON
-runRunSQL q@RunSQL {..} = do
+runRunSQL sqlGen q@RunSQL {..} = do
   sourceConfig <- askSourceConfig @('Postgres pgKind) rSource
   traceCtx <- Tracing.currentContext
   userInfo <- askUserInfo
@@ -191,19 +229,110 @@ runRunSQL q@RunSQL {..} = do
   if (isSchemaCacheBuildRequiredRunSQL q)
     then do
       -- see Note [Checking metadata consistency in run_sql]
-      withMetadataCheck @pgKind rSource rCascade rTxAccessMode $
-        withTraceContext traceCtx $
-          withUserInfo userInfo $
-            execRawSQL rSql
+      withMetadataCheck @pgKind sqlGen rSource rCascade pgExecTxType
+        $ withTraceContext traceCtx
+        $ withUserInfo userInfo
+        $ execSQL rSql
     else do
-      runTxWithCtx pgExecCtx rTxAccessMode $ execRawSQL rSql
+      runTxWithCtx pgExecCtx pgExecTxType RunSQLQuery $ execSQL rSql
   where
+    execSQL :: (MonadTx n) => Text -> n EncJSON
+    execSQL =
+      if rNoTransaction
+        then -- If the SQL contains multiple statements separated by ';', Postgres will execute them in a single transaction.
+        -- Ref: https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-MULTI-STATEMENT
+        -- Hence, it is defeating the purpose of no_transaction. To avoid this, split the SQL into multiple statements
+        -- and execute them one by one.
+          execMultipleStatements
+        else execRawSQL
+
     execRawSQL :: (MonadTx n) => Text -> n EncJSON
     execRawSQL =
-      fmap (encJFromJValue @RunSQLRes) . liftTx . Q.multiQE rawSqlErrHandler . Q.fromText
-      where
-        rawSqlErrHandler txe =
-          (err400 PostgresError "query execution failed") {qeInternal = Just $ ExtraInternal $ toJSON txe}
+      fmap (encJFromJValue @RunSQLRes) . liftTx . PG.multiQE rawSqlErrHandler . PG.fromText
+
+    execMultipleStatements :: (MonadTx n) => Text -> n EncJSON
+    execMultipleStatements sql = do
+      -- If the SQL contains multiple statements, execute them one by one.
+      -- And return the result of the last statement.
+      let go [] = execRawSQL sql -- If no statements, execute the whole SQL
+          go [sql'] = execRawSQL sql' -- This is the last statement, return its result
+          go (sql' : sqls') = do
+            _ <- execRawSQL sql'
+            go sqls'
+      go $ splitSQLStatements sql
+
+    rawSqlErrHandler :: PG.PGTxErr -> QErr
+    rawSqlErrHandler txe =
+      (err400 PostgresError "query execution failed") {qeInternal = Just $ ExtraInternal $ toJSON txe}
+
+    pgExecTxType :: PGExecTxType
+    pgExecTxType =
+      if rNoTransaction
+        then case rTxAccessMode of
+          PG.ReadOnly -> NoTxRead
+          PG.ReadWrite -> NoTxReadWrite
+        else Tx rTxAccessMode Nothing
+
+-- | Splits SQL input into separate statements while handling comments and strings.
+splitSQLStatements :: Text -> [Text]
+splitSQLStatements = filter (not . T.null) . map T.strip . process T.empty False Nothing False
+  where
+    process :: Text -> Bool -> Maybe Text -> Bool -> Text -> [Text]
+    process acc inString dollarTag inComment txt =
+      case T.uncons txt of
+        Nothing -> [acc | not (T.null acc)]
+        Just (c, rest) ->
+          case c of
+            '-'
+              | "--" `T.isPrefixOf` txt ->
+                  let rest' = T.dropWhile (/= '\n') rest
+                      rest'' = case T.uncons rest' of
+                        Just ('\n', rs) -> rs
+                        _ -> rest'
+                   in process acc inString dollarTag False rest''
+            '/'
+              | "/*" `T.isPrefixOf` txt ->
+                  process acc inString dollarTag False (dropBlockComment rest)
+            '\'' | isNothing dollarTag && not inComment ->
+              case T.uncons rest of
+                Just ('\'', rest') ->
+                  process (acc <> "''") inString dollarTag inComment rest'
+                _ ->
+                  process (T.snoc acc '\'') (not inString) dollarTag inComment rest
+            '$' ->
+              case dollarTag of
+                Just tag
+                  | tag `T.isPrefixOf` txt ->
+                      process (acc <> tag <> "$") inString Nothing inComment (T.drop (T.length tag + 1) txt)
+                _
+                  | not (inString || inComment) ->
+                      let (tag', remaining) = readDollarTag txt
+                       in if T.null tag'
+                            then process (T.snoc acc '$') inString dollarTag inComment rest
+                            else process (acc <> tag' <> "$") inString (Just tag') inComment remaining
+                  | otherwise ->
+                      process (T.snoc acc '$') inString dollarTag inComment rest
+            ';'
+              | not inString && isNothing dollarTag && not inComment ->
+                  acc : process T.empty inString dollarTag inComment rest
+            _ ->
+              process (T.snoc acc c) inString dollarTag inComment rest
+
+    dropBlockComment :: Text -> Text
+    dropBlockComment txt =
+      case T.breakOn "*/" txt of
+        (_before, after) -> if "*/" `T.isPrefixOf` after then T.drop 2 after else ""
+
+    readDollarTag :: Text -> (Text, Text)
+    readDollarTag txt =
+      let afterDollar = T.drop 1 txt
+          tagBody = T.takeWhile (/= '$') afterDollar
+       in if T.length afterDollar
+            > T.length tagBody
+            && T.index afterDollar (T.length tagBody)
+            == '$'
+            then ("$" <> tagBody, T.drop (T.length tagBody + 2) txt)
+            else ("", T.drop 1 txt)
 
 -- | @'withMetadataCheck' source cascade txAccess runSQLQuery@ executes @runSQLQuery@ and checks if the schema changed as a
 -- result. If it did, it checks to ensure the changes do not violate any integrity constraints, and
@@ -213,47 +342,49 @@ withMetadataCheck ::
   forall (pgKind :: PostgresKind) a m.
   ( BackendMetadata ('Postgres pgKind),
     ToMetadataFetchQuery pgKind,
+    FetchTableMetadata pgKind,
+    FetchFunctionMetadata pgKind,
     CacheRWM m,
-    HasServerConfigCtx m,
     MetadataM m,
     MonadBaseControl IO m,
     MonadError QErr m,
     MonadIO m
   ) =>
+  SQLGenCtx ->
   SourceName ->
   Bool ->
-  Q.TxAccess ->
-  Q.TxET QErr m a ->
+  PGExecTxType ->
+  PG.TxET QErr m a ->
   m a
-withMetadataCheck source cascade txAccess runSQLQuery = do
-  SourceInfo _ tableCache functionCache sourceConfig _ _ <- askSourceInfo @('Postgres pgKind) source
+withMetadataCheck sqlGen source cascade txType runSQLQuery = do
+  SourceInfo {..} <- askSourceInfo @('Postgres pgKind) source
 
   -- Run SQL query and metadata checker in a transaction
-  (queryResult, metadataUpdater) <- runTxWithMetadataCheck source sourceConfig txAccess tableCache functionCache cascade runSQLQuery
+  (queryResult, metadataUpdater) <- runTxWithMetadataCheck source _siConfiguration txType _siTables _siFunctions cascade runSQLQuery
 
   -- Build schema cache with updated metadata
-  withNewInconsistentObjsCheck $
-    buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
+  withNewInconsistentObjsCheck
+    $ buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
 
   postRunSQLSchemaCache <- askSchemaCache
 
   -- Recreate event triggers in hdb_catalog. Event triggers are dropped before executing @'runSQLQuery'.
-  recreateEventTriggers sourceConfig postRunSQLSchemaCache
+  recreateEventTriggers _siConfiguration postRunSQLSchemaCache
 
   pure queryResult
   where
     recreateEventTriggers :: PGSourceConfig -> SchemaCache -> m ()
     recreateEventTriggers sourceConfig schemaCache = do
       let tables = fromMaybe mempty $ unsafeTableCache @('Postgres pgKind) source $ scSources schemaCache
-      serverConfigCtx <- askServerConfigCtx
-      liftEitherM $
-        runPgSourceWriteTx sourceConfig $
-          forM_ (M.elems tables) $ \(TableInfo coreInfo _ eventTriggers _) -> do
-            let table = _tciName coreInfo
-                columns = getCols $ _tciFieldInfoMap coreInfo
-            forM_ (M.toList eventTriggers) $ \(triggerName, eti) -> do
-              let opsDefinition = etiOpsDef eti
-              flip runReaderT serverConfigCtx $ mkAllTriggersQ triggerName table columns opsDefinition
+      liftEitherM
+        $ runPgSourceWriteTx sourceConfig RunSQLQuery
+        $ forM_ (HashMap.elems tables)
+        $ \(TableInfo coreInfo _ eventTriggers _) -> do
+          let table = _tciName coreInfo
+              columns = fmap (\(SCIScalarColumn col) -> col) $ getCols $ _tciFieldInfoMap coreInfo
+          forM_ (HashMap.toList eventTriggers) $ \(triggerName, EventTriggerInfo {etiOpsDef, etiTriggerOnReplication}) -> do
+            flip runReaderT sqlGen
+              $ mkAllTriggersQ triggerName table etiTriggerOnReplication columns etiOpsDef
 
 -- | @'runTxWithMetadataCheck source sourceConfig txAccess tableCache functionCache cascadeDependencies tx' checks for
 -- changes in GraphQL Engine metadata when a @'tx' is executed on the database alters Postgres
@@ -263,6 +394,8 @@ runTxWithMetadataCheck ::
   forall m a (pgKind :: PostgresKind).
   ( BackendMetadata ('Postgres pgKind),
     ToMetadataFetchQuery pgKind,
+    FetchTableMetadata pgKind,
+    FetchFunctionMetadata pgKind,
     CacheRWM m,
     MonadIO m,
     MonadBaseControl IO m,
@@ -270,103 +403,107 @@ runTxWithMetadataCheck ::
   ) =>
   SourceName ->
   SourceConfig ('Postgres pgKind) ->
-  Q.TxAccess ->
+  PGExecTxType ->
   TableCache ('Postgres pgKind) ->
   FunctionCache ('Postgres pgKind) ->
   Bool ->
-  Q.TxET QErr m a ->
+  PG.TxET QErr m a ->
   m (a, MetadataModifier)
-runTxWithMetadataCheck source sourceConfig txAccess tableCache functionCache cascadeDependencies tx =
-  liftEitherM $
-    runExceptT $
-      runTx (_pscExecCtx sourceConfig) txAccess $ do
-        -- Running in a transaction helps to rollback the @'tx' execution in case of any exceptions
+runTxWithMetadataCheck source sourceConfig txType tableCache functionCache cascadeDependencies tx =
+  liftEitherM
+    $ runExceptT
+    $ _pecRunTx (_pscExecCtx sourceConfig) (PGExecCtxInfo txType RunSQLQuery)
+    $ do
+      -- Following steps maybe executed in a transaction depending on @'txType'.
+      -- Running in a transaction helps to rollback the @'tx' execution in case of any exceptions.
 
-        -- Before running the @'tx', fetch metadata of existing tables and functions from Postgres.
-        let tableNames = M.keys tableCache
-            computedFieldFunctions = concatMap getComputedFieldFunctions (M.elems tableCache)
-            functionNames = M.keys functionCache <> computedFieldFunctions
-        (preTxTablesMeta, preTxFunctionsMeta) <- fetchTablesFunctionsMetadata tableCache tableNames functionNames
+      -- Before running the @'tx', fetch metadata of existing tables and functions from Postgres.
+      let tableNames = HashMap.keysSet tableCache
+          computedFieldFunctions = mconcat $ map getComputedFieldFunctions (HashMap.elems tableCache)
+          functionNames = HashMap.keysSet functionCache <> computedFieldFunctions
+      (preTxTablesMeta, preTxFunctionsMeta) <- fetchTablesFunctionsMetadata tableCache tableNames functionNames
 
-        -- Since the @'tx' may alter table/function names we use the OIDs of underlying tables
-        -- (sourced from 'pg_class' for tables and 'pg_proc' for functions), which remain unchanged in the
-        -- case if a table/function is renamed.
-        let tableOids = map (_ptmiOid . tmInfo) preTxTablesMeta
-            functionOids = map fmOid preTxFunctionsMeta
+      -- Since the @'tx' may alter table/function names we use the OIDs of underlying tables
+      -- (sourced from 'pg_class' for tables and 'pg_proc' for functions), which remain unchanged in the
+      -- case if a table/function is renamed.
+      let tableOids = HS.fromList $ map (_ptmiOid . Diff.tmInfo) preTxTablesMeta
+          functionOids = HS.fromList $ map Diff.fmOid preTxFunctionsMeta
 
-        -- Run the transaction
-        txResult <- tx
+      -- Run the transaction
+      txResult <- tx
 
-        (postTxTablesMeta, postTxFunctionMeta) <-
-          uncurry (fetchTablesFunctionsMetadata tableCache)
-            -- Fetch names of tables and functions using OIDs which also contains renamed items
-            =<< fetchTablesFunctionsFromOids tableOids functionOids
+      (postTxTablesMeta, postTxFunctionMeta) <-
+        uncurry (fetchTablesFunctionsMetadata tableCache)
+          -- Fetch names of tables and functions using OIDs which also contains renamed items
+          =<< fetchTablesFunctionsFromOids tableOids functionOids
 
-        -- Calculate the tables diff (dropped & altered tables)
-        let tablesDiff = getTablesDiff preTxTablesMeta postTxTablesMeta
-            -- Calculate the functions diff. For calculating diff for functions, only consider
-            -- query/mutation functions and exclude functions underpinning computed fields.
-            -- Computed field functions are being processed under each table diff.
-            -- See @'getTablesDiff' and @'processTablesDiff'
-            excludeComputedFieldFunctions = filter ((`M.member` functionCache) . fmFunction)
-            functionsDiff =
-              getFunctionsDiff
-                (excludeComputedFieldFunctions preTxFunctionsMeta)
-                (excludeComputedFieldFunctions postTxFunctionMeta)
+      -- Calculate the tables diff (dropped & altered tables)
+      let tablesDiff = Diff.getTablesDiff preTxTablesMeta postTxTablesMeta
+          -- Calculate the functions diff. For calculating diff for functions, only consider
+          -- query/mutation functions and exclude functions underpinning computed fields.
+          -- Computed field functions are being processed under each table diff.
+          -- See @'getTablesDiff' and @'Diff.processTablesDiff'
+          excludeComputedFieldFunctions = filter ((`HashMap.member` functionCache) . Diff.fmFunction)
+          functionsDiff =
+            Diff.getFunctionsDiff
+              (excludeComputedFieldFunctions preTxFunctionsMeta)
+              (excludeComputedFieldFunctions postTxFunctionMeta)
 
-        dontAllowFunctionOverloading $
-          getOverloadedFunctions
-            (M.keys functionCache)
-            (excludeComputedFieldFunctions postTxFunctionMeta)
+      dontAllowFunctionOverloading
+        $ Diff.getOverloadedFunctions
+          (HashMap.keys functionCache)
+          (excludeComputedFieldFunctions postTxFunctionMeta)
 
-        -- Update metadata with schema change caused by @'tx'
-        metadataUpdater <- execWriterT do
-          -- Collect indirect dependencies of altered tables
-          tableIndirectDeps <- getIndirectDependenciesFromTableDiff source tablesDiff
+      -- Update metadata with schema change caused by @'tx'
+      metadataUpdater <- execWriterT do
+        -- Collect indirect dependencies of altered tables
+        tableIndirectDeps <- Diff.getIndirectDependenciesFromTableDiff source tablesDiff
 
-          -- If table indirect dependencies exist and cascading is not enabled then report an exception
-          unless (null tableIndirectDeps || cascadeDependencies) $ reportDependentObjectsExist tableIndirectDeps
+        -- If table indirect dependencies exist and cascading is not enabled then report an exception
+        unless (null tableIndirectDeps || cascadeDependencies) $ reportDependentObjectsExist tableIndirectDeps
 
-          -- Purge all the table dependents
-          traverse_ purgeSourceAndSchemaDependencies tableIndirectDeps
+        -- Purge all the table dependents
+        traverse_ purgeSourceAndSchemaDependencies tableIndirectDeps
 
-          -- Collect function names from purged table dependencies
-          let purgedFunctions = collectFunctionsInDeps tableIndirectDeps
-              FunctionsDiff droppedFunctions alteredFunctions = functionsDiff
+        -- Collect function names from purged table dependencies
+        let purgedFunctions = collectFunctionsInDeps tableIndirectDeps
+            Diff.FunctionsDiff droppedFunctions alteredFunctions = functionsDiff
 
-          -- Drop functions in metadata. Exclude functions that were already dropped as part of table indirect dependencies
-          purgeFunctionsFromMetadata $ droppedFunctions \\ purgedFunctions
+        -- Drop functions in metadata. Exclude functions that were already dropped as part of table indirect dependencies
+        purgeFunctionsFromMetadata $ droppedFunctions \\ purgedFunctions
 
-          -- If any function type is altered to VOLATILE then raise an exception
-          dontAllowFunctionAlteredVolatile alteredFunctions
+        -- If any function type is altered to VOLATILE then raise an exception
+        dontAllowFunctionAlteredVolatile alteredFunctions
 
-          -- Propagate table changes to metadata
-          processTablesDiff source tableCache tablesDiff
+        -- Propagate table changes to metadata
+        Diff.processTablesDiff source tableCache tablesDiff
 
-        pure (txResult, metadataUpdater)
+      pure (txResult, metadataUpdater)
   where
     dontAllowFunctionOverloading ::
-      MonadError QErr n =>
+      (MonadError QErr n) =>
       [FunctionName ('Postgres pgKind)] ->
       n ()
     dontAllowFunctionOverloading overloadedFunctions =
-      unless (null overloadedFunctions) $
-        throw400 NotSupported $
-          "the following tracked function(s) cannot be overloaded: "
-            <> commaSeparated overloadedFunctions
+      unless (null overloadedFunctions)
+        $ throw400 NotSupported
+        $ "the following tracked function(s) cannot be overloaded: "
+        <> commaSeparated overloadedFunctions
 
     dontAllowFunctionAlteredVolatile ::
-      MonadError QErr n =>
+      (MonadError QErr n) =>
       [(FunctionName ('Postgres pgKind), FunctionVolatility)] ->
       n ()
     dontAllowFunctionAlteredVolatile alteredFunctions =
       forM_ alteredFunctions $ \(qf, newTy) -> do
-        when (newTy == FTVOLATILE) $
-          throw400 NotSupported $
-            "type of function " <> qf <<> " is altered to \"VOLATILE\" which is not supported now"
+        when (newTy == FTVOLATILE)
+          $ throw400 NotSupported
+          $ "type of function "
+          <> qf
+          <<> " is altered to \"VOLATILE\" which is not supported now"
 
     purgeFunctionsFromMetadata ::
-      Monad n =>
+      (Monad n) =>
       [FunctionName ('Postgres pgKind)] ->
       WriterT MetadataModifier n ()
     purgeFunctionsFromMetadata functions =
@@ -377,20 +514,25 @@ runTxWithMetadataCheck source sourceConfig txAccess tableCache functionCache cas
       flip mapMaybe deps \case
         SOSourceObj _ objectID
           | Just (SOIFunction qf) <- AB.unpackAnyBackend @('Postgres pgKind) objectID ->
-            Just qf
+              Just qf
         _ -> Nothing
 
 -- | Fetch list of tables and functions with provided oids
 fetchTablesFunctionsFromOids ::
   (MonadIO m) =>
-  [OID] ->
-  [OID] ->
-  Q.TxET QErr m ([TableName ('Postgres pgKind)], [FunctionName ('Postgres pgKind)])
+  HashSet OID ->
+  HashSet OID ->
+  PG.TxET
+    QErr
+    m
+    ( HS.HashSet (TableName ('Postgres pgKind)),
+      HS.HashSet (FunctionName ('Postgres pgKind))
+    )
 fetchTablesFunctionsFromOids tableOids functionOids =
-  ((Q.getAltJ *** Q.getAltJ) . Q.getRow)
-    <$> Q.withQE
+  ((PG.getViaJSON *** PG.getViaJSON) . PG.getRow)
+    <$> PG.withQE
       defaultTxErrorHandler
-      [Q.sql|
+      [PG.sql|
     SELECT
       COALESCE(
         ( SELECT
@@ -430,7 +572,7 @@ fetchTablesFunctionsFromOids tableOids functionOids =
         '[]'
       ) AS "functions"
   |]
-      (Q.AltJ $ map mkOidObject tableOids, Q.AltJ $ map mkOidObject functionOids)
+      (PG.ViaJSON $ map mkOidObject $ HS.toList tableOids, PG.ViaJSON $ map mkOidObject $ HS.toList $ functionOids)
       True
   where
     mkOidObject oid = object ["oid" .= oid]
@@ -440,5 +582,5 @@ fetchTablesFunctionsFromOids tableOids functionOids =
 getComputedFields :: TableInfo ('Postgres pgKind) -> [ComputedFieldInfo ('Postgres pgKind)]
 getComputedFields = getComputedFieldInfos . _tciFieldInfoMap . _tiCoreInfo
 
-getComputedFieldFunctions :: TableInfo ('Postgres pgKind) -> [FunctionName ('Postgres pgKind)]
-getComputedFieldFunctions = map (_cffName . _cfiFunction) . getComputedFields
+getComputedFieldFunctions :: TableInfo ('Postgres pgKind) -> HashSet (FunctionName ('Postgres pgKind))
+getComputedFieldFunctions = HS.fromList . map (_cffName . _cfiFunction) . getComputedFields

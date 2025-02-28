@@ -13,19 +13,20 @@ module Hasura.Backends.Postgres.Types.ComputedField
   )
 where
 
+import Autodocodec (HasCodec, optionalField', requiredField')
+import Autodocodec qualified as AC
 import Control.Lens.TH (makePrisms)
 import Data.Aeson.Casing
 import Data.Aeson.Extended
 import Hasura.Backends.Postgres.SQL.Types
 import Hasura.Backends.Postgres.Types.Function
-import Hasura.Incremental (Cacheable)
+import Hasura.Function.Cache
 import Hasura.Prelude
-import Hasura.RQL.Types.Function
 
 data ComputedFieldDefinition = ComputedFieldDefinition
-  { _cfdFunction :: !QualifiedFunction,
-    _cfdTableArgument :: !(Maybe FunctionArgName),
-    _cfdSessionArgument :: !(Maybe FunctionArgName)
+  { _cfdFunction :: QualifiedFunction,
+    _cfdTableArgument :: Maybe FunctionArgName,
+    _cfdSessionArgument :: Maybe FunctionArgName
   }
   deriving (Show, Eq, Generic)
 
@@ -33,7 +34,16 @@ instance NFData ComputedFieldDefinition
 
 instance Hashable ComputedFieldDefinition
 
-instance Cacheable ComputedFieldDefinition
+instance HasCodec ComputedFieldDefinition where
+  codec =
+    AC.object "PostgresComputedFieldDefinition"
+      $ ComputedFieldDefinition
+      <$> requiredField' "function"
+      AC..= _cfdFunction
+        <*> optionalField' "table_argument"
+      AC..= _cfdTableArgument
+        <*> optionalField' "session_argument"
+      AC..= _cfdSessionArgument
 
 instance ToJSON ComputedFieldDefinition where
   toJSON = genericToJSON hasuraJSON {omitNothingFields = True}
@@ -46,13 +56,11 @@ instance FromJSON ComputedFieldDefinition where
 data FunctionTableArgument
   = FTAFirst
   | FTANamed
-      !FunctionArgName
-      -- ^ argument name
-      !Int
-      -- ^ argument index
-  deriving (Show, Eq, Generic)
-
-instance Cacheable FunctionTableArgument
+      -- | argument name
+      FunctionArgName
+      -- | argument index
+      Int
+  deriving (Show, Eq, Ord, Generic)
 
 instance NFData FunctionTableArgument
 
@@ -66,13 +74,11 @@ instance ToJSON FunctionTableArgument where
 -- SQL function as a JSON object.
 data FunctionSessionArgument
   = FunctionSessionArgument
-      !FunctionArgName
-      -- ^ The argument name
-      !Int
-      -- ^ The ordinal position in the function input parameters
-  deriving (Show, Eq, Generic)
-
-instance Cacheable FunctionSessionArgument
+      -- | The argument name
+      FunctionArgName
+      -- | The ordinal position in the function input parameters
+      Int
+  deriving (Show, Eq, Ord, Generic)
 
 instance NFData FunctionSessionArgument
 
@@ -85,13 +91,11 @@ data ComputedFieldImplicitArguments = ComputedFieldImplicitArguments
   { _cffaTableArgument :: FunctionTableArgument,
     _cffaSessionArgument :: Maybe FunctionSessionArgument
   }
-  deriving stock (Show, Eq, Generic)
+  deriving stock (Show, Eq, Ord, Generic)
 
 instance NFData ComputedFieldImplicitArguments
 
 instance Hashable ComputedFieldImplicitArguments
-
-instance Cacheable ComputedFieldImplicitArguments
 
 instance ToJSON ComputedFieldImplicitArguments where
   toJSON = genericToJSON hasuraJSON
@@ -108,9 +112,7 @@ fromComputedFieldImplicitArguments sess _ = [AESession sess, AETableRow]
 data ComputedFieldReturn
   = CFRScalar PGScalarType
   | CFRSetofTable QualifiedTable
-  deriving (Show, Eq, Generic)
-
-instance Cacheable ComputedFieldReturn
+  deriving (Show, Eq, Ord, Generic)
 
 instance NFData ComputedFieldReturn
 
@@ -118,8 +120,8 @@ instance Hashable ComputedFieldReturn
 
 instance ToJSON ComputedFieldReturn where
   toJSON =
-    genericToJSON $
-      defaultOptions
+    genericToJSON
+      $ defaultOptions
         { constructorTagModifier = snakeCase . drop 3,
           sumEncoding = TaggedObject "type" "info"
         }

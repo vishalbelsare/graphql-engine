@@ -17,6 +17,7 @@ type PGRunSQLInput struct {
 	Cascade                  bool   `json:"cascade,omitempty" yaml:"cascade,omitempty"`
 	ReadOnly                 bool   `json:"read_only,omitempty" yaml:"read_only,omitempty"`
 	CheckMetadataConsistency *bool  `json:"check_metadata_consistency,omitempty" yaml:"check_metadata_consistency,omitempty"`
+	NoTransaction            *bool  `json:"no_transaction,omitempty" yaml:"no_transaction,omitempty"`
 }
 
 type PGRunSQLOutput struct {
@@ -40,3 +41,19 @@ type CitusSourceOps interface {
 type CitusRunSQLInput PGRunSQLInput
 
 type CitusRunSQLOutput PGRunSQLOutput
+
+type BigQuerySourceOps interface {
+	BigQueryRunSQL(input BigQueryRunSQLInput) (response *BigQueryRunSQLOutput, err error)
+}
+
+type BigQueryRunSQLInput PGRunSQLInput
+
+type BigQueryRunSQLOutput PGRunSQLOutput
+
+type CockroachSourceOps interface {
+	CockroachRunSQL(input CockroachRunSQLInput) (response *CockroachRunSQLOutput, err error)
+}
+
+type CockroachRunSQLInput PGRunSQLInput
+
+type CockroachRunSQLOutput PGRunSQLOutput

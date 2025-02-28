@@ -27,14 +27,12 @@ class TestV1Alpha1GraphQLErrors:
             'query': {'query': gql_query},
         }
 
-        if hge_ctx.hge_key is not None and hge_ctx.hge_webhook is None and hge_ctx.hge_jwt_key is None:
+        if hge_ctx.hge_key is not None and not hge_ctx.webhook and hge_ctx.hge_jwt_key is None:
             # Test whether it is forbidden when incorrect/no admin_secret is specified
             validate.test_forbidden_when_admin_secret_reqd(hge_ctx, http_conf)
-
-        elif hge_ctx.hge_webhook is not None:
-            if not hge_ctx.webhook_insecure:
+        elif hge_ctx.webhook:
             # Check whether the output is also forbidden when webhook returns forbidden
-                validate.test_forbidden_webhook(hge_ctx, http_conf)
+            validate.test_forbidden_webhook(hge_ctx, http_conf)
         else:
             assert True
 
@@ -134,6 +132,7 @@ class TestV1Alpha1GraphQLErrors:
 
     def test_v1alpha1_ws_start_error(self, hge_ctx):
         ws_client = GQLWsClient(hge_ctx, '/v1alpha1/graphql')
+        ws_client.create_conn()
         query = {'query': '{ author { name } }'}
         frame = {
             'id': '1',

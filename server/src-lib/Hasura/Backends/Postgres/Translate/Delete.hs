@@ -8,22 +8,26 @@ module Hasura.Backends.Postgres.Translate.Delete
   )
 where
 
+import Hasura.Authentication.User (UserInfo)
 import Hasura.Backends.Postgres.SQL.DML qualified as S
 import Hasura.Backends.Postgres.Translate.BoolExp
+import Hasura.Base.Error (QErr)
 import Hasura.Prelude
 import Hasura.RQL.IR.BoolExp
 import Hasura.RQL.IR.Delete
 import Hasura.RQL.Types.Backend
-import Hasura.SQL.Backend
+import Hasura.RQL.Types.BackendType
 
 mkDelete ::
-  Backend ('Postgres pgKind) =>
+  (Backend ('Postgres pgKind), MonadIO m, MonadError QErr m) =>
+  UserInfo ->
   AnnDel ('Postgres pgKind) ->
-  S.SQLDelete
-mkDelete (AnnDel tn (fltr, wc) _ _ _) =
-  S.SQLDelete tn Nothing tableFltr $ Just S.returningStar
-  where
-    tableFltr =
-      Just $
-        S.WhereFrag $
-          toSQLBoolExp (S.QualTable tn) $ andAnnBoolExps fltr wc
+  m S.SQLDelete
+mkDelete userInfo (AnnDel tn (fltr, wc) _ _ _ _ _) = do
+  boolExp <- toSQLBoolExp userInfo (S.QualTable tn) $ andAnnBoolExps fltr wc
+  let tableFltr =
+        Just
+          . S.WhereFrag
+          . S.simplifyBoolExp
+          $ boolExp
+  pure $ S.SQLDelete tn Nothing tableFltr $ Just S.returningStar

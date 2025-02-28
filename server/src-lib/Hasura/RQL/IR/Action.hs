@@ -11,6 +11,7 @@ module Hasura.RQL.IR.Action
     _ACFScalar,
     AnnActionExecution (..),
     aaeName,
+    aaeType,
     aaeOutputType,
     aaeFields,
     aaePayload,
@@ -18,6 +19,7 @@ module Hasura.RQL.IR.Action
     aaeWebhook,
     aaeHeaders,
     aaeForwardClientHeaders,
+    aaeIgnoredClientHeaders,
     aaeTimeOut,
     aaeRequestTransform,
     aaeResponseTransform,
@@ -36,6 +38,7 @@ module Hasura.RQL.IR.Action
     aaaqDefinitionList,
     aaaqStringifyNum,
     aaaqForwardClientHeaders,
+    aaaqIgnoredClientHeaders,
     aaaqSource,
     ActionSourceInfo (..),
     ActionOutputFields,
@@ -45,14 +48,13 @@ where
 
 import Control.Lens (makeLenses, makePrisms)
 import Data.Aeson qualified as J
-import Data.HashMap.Strict qualified as Map
+import Data.HashMap.Strict qualified as HashMap
 import Data.Kind (Type)
-import Hasura.GraphQL.Schema.Options (StringifyNumbers)
 import Hasura.Prelude
-import Hasura.RQL.DDL.Headers
 import Hasura.RQL.DDL.Webhook.Transform (MetadataResponseTransform, RequestTransform)
 import Hasura.RQL.Types.Action qualified as RQL
 import Hasura.RQL.Types.Backend
+import Hasura.RQL.Types.BackendType
 import Hasura.RQL.Types.Common (EnvRecord, FieldName, Fields, ResolvedWebhook, SourceName, Timeout)
 import Hasura.RQL.Types.CustomTypes
   ( AnnotatedObjectType (..),
@@ -61,8 +63,10 @@ import Hasura.RQL.Types.CustomTypes
     ObjectFieldDefinition (..),
     ObjectFieldName (..),
   )
-import Hasura.SQL.Backend
+import Hasura.RQL.Types.Headers
+import Hasura.RQL.Types.Schema.Options (StringifyNumbers)
 import Language.GraphQL.Draft.Syntax qualified as G
+import Network.HTTP.Types qualified as HTTP
 
 -- | Internal representation for a selection of fields on the result of an action.
 -- Type parameter r will be either
@@ -77,7 +81,7 @@ data ActionFieldG (r :: Type)
   | -- | Constant text value (used for __typename fields)
     ACFExpression Text
   | -- | Nested object. G.Name is the original field name from the object type.
-    ACFNestedObject G.Name !(ActionFieldsG r)
+    ACFNestedObject G.Name (ActionFieldsG r)
   deriving (Eq, Show, Functor, Foldable, Traversable)
 
 type ActionFieldsG r = Fields (ActionFieldG r)
@@ -99,44 +103,48 @@ data ActionRemoteRelationshipSelect r = ActionRemoteRelationshipSelect
 $(makePrisms ''ActionFieldG)
 
 data AnnActionExecution (r :: Type) = AnnActionExecution
-  { _aaeName :: !RQL.ActionName,
+  { _aaeName :: RQL.ActionName,
+    -- | action type
+    _aaeType :: RQL.ActionType,
     -- | output type
-    _aaeOutputType :: !GraphQLType,
+    _aaeOutputType :: GraphQLType,
     -- | output selection
-    _aaeFields :: !(ActionFieldsG r),
+    _aaeFields :: (ActionFieldsG r),
     -- | jsonified input arguments
-    _aaePayload :: !J.Value,
+    _aaePayload :: J.Value,
     -- | to validate the response fields from webhook
-    _aaeOutputFields :: !ActionOutputFields,
-    _aaeWebhook :: !(EnvRecord ResolvedWebhook),
-    _aaeHeaders :: ![HeaderConf],
-    _aaeForwardClientHeaders :: !Bool,
-    _aaeTimeOut :: !Timeout,
-    _aaeRequestTransform :: !(Maybe RequestTransform),
-    _aaeResponseTransform :: !(Maybe MetadataResponseTransform)
+    _aaeOutputFields :: ActionOutputFields,
+    _aaeWebhook :: EnvRecord ResolvedWebhook,
+    _aaeHeaders :: [HeaderConf],
+    _aaeForwardClientHeaders :: Bool,
+    _aaeIgnoredClientHeaders :: [Text],
+    _aaeTimeOut :: Timeout,
+    _aaeRequestTransform :: Maybe RequestTransform,
+    _aaeResponseTransform :: Maybe MetadataResponseTransform
   }
   deriving stock (Functor, Foldable, Traversable)
 
-type ActionOutputFields = Map.HashMap G.Name G.GType
+type ActionOutputFields = HashMap.HashMap G.Name G.GType
 
 getActionOutputFields :: AnnotatedOutputType -> ActionOutputFields
 getActionOutputFields inp = case inp of
-  AOTObject aot -> Map.fromList do
+  AOTObject aot -> HashMap.fromList do
     ObjectFieldDefinition {..} <- toList $ _aotFields aot
     pure (unObjectFieldName _ofdName, fst _ofdType)
-  AOTScalar _ -> Map.empty
+  AOTScalar _ -> HashMap.empty
 
 data AnnActionMutationAsync = AnnActionMutationAsync
-  { _aamaName :: !RQL.ActionName,
-    _aamaForwardClientHeaders :: !Bool,
+  { _aamaName :: RQL.ActionName,
+    _aamaForwardClientHeaders :: Bool,
+    _aamaIgnoredClientHeaders :: [HTTP.HeaderName],
     -- | jsonified input arguments
-    _aamaPayload :: !J.Value
+    _aamaPayload :: J.Value
   }
   deriving (Show, Eq)
 
 data AsyncActionQueryFieldG (r :: Type)
-  = AsyncTypename !Text
-  | AsyncOutput !(ActionFieldsG r)
+  = AsyncTypename Text
+  | AsyncOutput (ActionFieldsG r)
   | AsyncId
   | AsyncCreatedAt
   | AsyncErrors
@@ -145,14 +153,15 @@ data AsyncActionQueryFieldG (r :: Type)
 type AsyncActionQueryFieldsG r = Fields (AsyncActionQueryFieldG r)
 
 data AnnActionAsyncQuery (b :: BackendType) (r :: Type) = AnnActionAsyncQuery
-  { _aaaqName :: !RQL.ActionName,
-    _aaaqActionId :: !RQL.ActionId,
-    _aaaqOutputType :: !GraphQLType,
-    _aaaqFields :: !(AsyncActionQueryFieldsG r),
-    _aaaqDefinitionList :: ![(Column b, ScalarType b)],
-    _aaaqStringifyNum :: !StringifyNumbers,
-    _aaaqForwardClientHeaders :: !Bool,
-    _aaaqSource :: !(ActionSourceInfo b)
+  { _aaaqName :: RQL.ActionName,
+    _aaaqActionId :: RQL.ActionId,
+    _aaaqOutputType :: GraphQLType,
+    _aaaqFields :: AsyncActionQueryFieldsG r,
+    _aaaqDefinitionList :: [(Column b, ScalarType b)],
+    _aaaqStringifyNum :: StringifyNumbers,
+    _aaaqForwardClientHeaders :: Bool,
+    _aaaqIgnoredClientHeaders :: [HTTP.HeaderName],
+    _aaaqSource :: ActionSourceInfo b
   }
   deriving stock (Functor, Foldable, Traversable)
 

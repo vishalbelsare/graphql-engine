@@ -1,15 +1,16 @@
 ---
-sidebar_label: Network Options
-sidebar_position: 19
-description: Manage network options with the Hasura metadata API
+sidebar_label: Network options
+sidebar_position: 22
+description: Manage network options with the Hasura Metadata API
 keywords:
-   - hasura
-   - docs
-   - metadata API
-   - API reference
-   - network options
-   - TLS
-   - allowlis
+  - hasura
+  - docs
+  - Metadata API
+  - API reference
+  - network options
+  - TLS
+  - allowlist
+  - TLS allow list
 ---
 
 # Metadata API Reference: Network Options (v2.0 and above)
@@ -19,11 +20,11 @@ keywords:
 Here's the API to modify any `Network` metadata. One of the options is
 to manage a `TLS allowlist`.
 
-## TLS Allowlist
+## TLS allow list
 
-The TLS Allowlist represents a set of services that are permitted to use
+The TLS allow list represents a set of services that are permitted to use
 self-signed certificates - primarily intended for use in development and
-staging environments, services can be whitelisted by a `host`, and
+staging environments, services can be allowlisted by a `host`, and
 optionally (service id) `port`.
 
 ## add_host_to_tls_allowlist {#metadata-add-host-to-tls-allowlist}
@@ -42,7 +43,7 @@ X-Hasura-Role: admin
     "type": "add_host_to_tls_allowlist",
     "args": {
         "host": "graphql.hasura.io",
-        "suffix": "core.graphql",
+        "suffix": "4183",
         "permissions": ["self-signed"]
     }
 }
@@ -51,15 +52,14 @@ X-Hasura-Role: admin
 ### Args syntax {#add-host-to-tls-allowlist-syntax}
 
 | Key         | Required | Schema     | Description                                                                                                                                          |
-|-------------|----------|------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------- | -------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | host        | true     | `String`   | the hostname/domain of the endpoint                                                                                                                  |
 | suffix      | false    | `String`   | suffix for the service (this is usually reserved for the service port number)                                                                        |
 | permissions | false    | `[String]` | Can be only `["self-signed"]` until more permissions are supported. "self-signed" allows self-signed, name mismatches, and non-X509.V3 certificates. |
 
-
 ## drop_host_from_tls_allowlist {#metadata-drop-host-from-tls-allowlist}
 
-`drop_host_from_tls_allowlist` is used to drop an endpoint from the TLS allowlist.
+`drop_host_from_tls_allowlist` is used to drop an endpoint from the TLS allow list.
 
 ```http
 POST /v1/metadata HTTP/1.1
@@ -69,14 +69,15 @@ X-Hasura-Role: admin
 {
     "type": "drop_host_from_tls_allowlist",
     "args": {
-        "host": "graphql.hasura.io"
+        "host": "graphql.hasura.io",
+        "suffix": "4183"
     }
 }
 ```
 
 ### Args syntax {#drop-host-from-tls-allowlist-syntax}
 
-| Key  | Required | Schema   | Description                                                                    |
-|------|----------|----------|--------------------------------------------------------------------------------|
-| host | true     | `String` | The hostname/domain of the endpoint that was previously added to the allowlist |
-
+| Key    | Required | Schema   | Description                                                                     |
+| ----   | -------- | -------- | ------------------------------------------------------------------------------- |
+| host   | true     | `String` | the hostname/domain of the endpoint that was previously added to the allow list |
+| suffix | false    | `String` | suffix for the service (this is usually reserved for the service port number)   |

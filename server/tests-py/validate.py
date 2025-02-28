@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 
-import time
-import ruamel.yaml as yaml
-from ruamel.yaml.compat import ordereddict, StringIO
-from ruamel.yaml.comments import CommentedMap
-import json
+import base64
 import copy
 import graphql
-import os
-import base64
+import json
 import jsondiff
-import jwt
+import os
+import pytest
 import queue
 import random
-import warnings
-import pytest
+import ruamel.yaml as yaml
+from ruamel.yaml.comments import CommentedMap
+from ruamel.yaml.compat import ordereddict, StringIO
 import textwrap
+import warnings
+import PortToHaskell
 
-from context import GQLWsClient, PytestConf
+from context import HGECtx, PytestConf
+from fixtures.tls import TLSTrust
 
 def check_keys(keys, obj):
     for k in keys:
@@ -185,7 +185,7 @@ def test_forbidden_when_admin_secret_reqd(hge_ctx, conf):
     })
 
     # Test with random admin secret
-    headers['X-Hasura-Admin-Secret'] = base64.b64encode(os.urandom(30))
+    headers['X-Hasura-Admin-Secret'] = base64.b64encode(os.urandom(30)).decode()
     code, resp, resp_hdrs = hge_ctx.anyq(conf['url'], conf['query'], headers)
     #assert code in [401,404], "\n" + yaml.dump({
     assert code in status, "\n" + yaml.dump({
@@ -219,27 +219,9 @@ def test_forbidden_webhook(hge_ctx, conf):
         'request id': resp_hdrs.get('x-request-id')
     })
 
-def mk_claims_with_namespace_path(claims,hasura_claims,namespace_path):
-    if namespace_path is None:
-        claims['https://hasura.io/jwt/claims'] = hasura_claims
-    elif namespace_path == "$":
-        claims.update(hasura_claims)
-    elif namespace_path == "$.hasura_claims":
-        claims['hasura_claims'] = hasura_claims
-    elif namespace_path == "$.hasura['claims%']":
-        claims['hasura'] = {}
-        claims['hasura']['claims%'] = hasura_claims
-    else:
-        raise Exception(
-                '''claims_namespace_path should not be anything
-                other than $.hasura_claims, $.hasura['claims%'] or $ for testing. The
-                value of claims_namespace_path was {}'''.format(namespace_path))
-    return claims
-
 # Returns the response received and a bool indicating whether the test passed
 # or not (this will always be True unless we are `--accepting`)
-def check_query(hge_ctx, conf, transport='http', add_auth=True, claims_namespace_path=None, gqlws=False):
-    hge_ctx.tests_passed = True
+def check_query(hge_ctx: HGECtx, conf, transport='http', add_auth=True, gqlws=False):
     headers = {}
     if 'headers' in conf:
         # Convert header values to strings, as the YAML parser might give us an internal class.
@@ -253,40 +235,21 @@ def check_query(hge_ctx, conf, transport='http', add_auth=True, claims_namespace
         headers['X-Hasura-Role'] = 'admin'
 
     if add_auth:
-        # Use the hasura role specified in the test case, and create a JWT token
-        if hge_ctx.hge_jwt_key is not None and len(headers) > 0 and 'X-Hasura-Role' in headers:
-            hClaims = dict()
-            hClaims['X-Hasura-Allowed-Roles'] = [headers['X-Hasura-Role']]
-            hClaims['X-Hasura-Default-Role'] = headers['X-Hasura-Role']
-            for key in headers:
-                if key != 'X-Hasura-Role':
-                    hClaims[key] = headers[key]
-            claim = {
-                "sub": "foo",
-                "name": "bar",
-            }
-            claim = mk_claims_with_namespace_path(claim, hClaims, claims_namespace_path)
-            headers['Authorization'] = 'Bearer ' + jwt.encode(claim, hge_ctx.hge_jwt_key, algorithm=hge_ctx.hge_jwt_algo)
-
         # Use the hasura role specified in the test case, and create an authorization token which will be verified by webhook
-        if hge_ctx.hge_webhook is not None and len(headers) > 0:
-            if not hge_ctx.webhook_insecure:
-            # Check whether the output is also forbidden when webhook returns forbidden
+        if hge_ctx.webhook and len(headers) > 0:
+            if hge_ctx.webhook.tls_trust != TLSTrust.INSECURE:
+                # Check whether the output is also forbidden when webhook returns forbidden
                 test_forbidden_webhook(hge_ctx, conf)
-            headers['X-Hasura-Auth-Mode'] = 'webhook'
-            headers_new = dict()
-            headers_new['Authorization'] = 'Bearer ' + base64.b64encode(json.dumps(headers).encode('utf-8')).decode(
-                'utf-8')
-            headers = headers_new
+            headers = authorize_for_webhook(headers)
 
-        # The case as admin with admin-secret and jwt/webhook
-        elif (
-                hge_ctx.hge_webhook is not None or hge_ctx.hge_jwt_key is not None) and hge_ctx.hge_key is not None and len(
-                headers) == 0:
+        # The case as admin with admin-secret and webhook
+        elif hge_ctx.webhook \
+             and hge_ctx.hge_key is not None \
+             and len(headers) == 0:
             headers['X-Hasura-Admin-Secret'] = hge_ctx.hge_key
 
         # The case as admin with only admin-secret
-        elif hge_ctx.hge_key is not None and hge_ctx.hge_webhook is None and hge_ctx.hge_jwt_key is None:
+        elif hge_ctx.hge_key is not None and not hge_ctx.webhook:
             # Test whether it is forbidden when incorrect/no admin_secret is specified
             test_forbidden_when_admin_secret_reqd(hge_ctx, conf)
             headers['X-Hasura-Admin-Secret'] = hge_ctx.hge_key
@@ -306,6 +269,13 @@ def check_query(hge_ctx, conf, transport='http', add_auth=True, claims_namespace
     elif transport == 'subscription':
         print('running via subscription')
         return validate_gql_ws_q(hge_ctx, conf, headers, retry=True, via_subscription=True, gqlws=gqlws)
+
+
+def authorize_for_webhook(headers: dict[str, str]) -> dict[str, str]:
+    headers['X-Hasura-Auth-Mode'] = 'webhook'
+    headers_new = dict()
+    headers_new['Authorization'] = 'Bearer ' + base64.b64encode(json.dumps(headers).encode('utf-8')).decode('utf-8')
+    return headers_new
 
 
 def validate_gql_ws_q(hge_ctx, conf, headers, retry=False, via_subscription=False, gqlws=False):
@@ -332,17 +302,13 @@ def validate_gql_ws_q(hge_ctx, conf, headers, retry=False, via_subscription=Fals
     else:
         ws_client = hge_ctx.ws_client
     print(ws_client.ws_url)
+
     if not headers or len(headers) == 0:
-        ws_client.init({})
+        ws_client.init_as_admin()
+    else:
+        ws_client.init(headers)
 
-    if ws_client.remote_closed or ws_client.is_closing:
-        ws_client.create_conn()
-        if not headers or len(headers) == 0 or hge_ctx.hge_key is None:
-            ws_client.init()
-        else:
-            ws_client.init_as_admin()
-
-    query_resp = ws_client.send_query(query, query_id='hge_test', headers=headers, timeout=15)
+    query_resp = ws_client.send_query(query, query_id='hge_test', timeout=15)
     resp = next(query_resp)
     print('websocket resp: ', resp)
 
@@ -350,7 +316,7 @@ def validate_gql_ws_q(hge_ctx, conf, headers, retry=False, via_subscription=Fals
         if retry:
             #Got query complete before payload. Retry once more
             print("Got query complete before getting query response payload. Retrying")
-            ws_client.recreate_conn()
+            ws_client.tear_down()
             return validate_gql_ws_q(hge_ctx, query, headers, exp_http_response, False)
         else:
             assert resp['type'] in ['data', 'error', 'next'], resp
@@ -375,7 +341,7 @@ def validate_gql_ws_q(hge_ctx, conf, headers, retry=False, via_subscription=Fals
         resp_done = next(query_resp)
         assert resp_done['type'] == 'complete'
 
-    return assert_graphql_resp_expected(resp['payload'], exp_http_response, query, skip_if_err_msg=hge_ctx.avoid_err_msg_checks)
+    return assert_graphql_resp_expected(resp['payload'], exp_http_response, query)
 
 def assert_response_code(url, query, code, exp_code, resp, body=None):
     assert code == exp_code, \
@@ -398,7 +364,7 @@ def validate_http_anyq(hge_ctx, url, query, headers, exp_code, exp_response, exp
     assert_response_code(url, query, code, exp_code, resp, body)
 
     if exp_response:
-        return assert_graphql_resp_expected(resp, exp_response, query, resp_hdrs, hge_ctx.avoid_err_msg_checks, exp_resp_hdrs=exp_resp_hdrs)
+        return assert_graphql_resp_expected(resp, exp_response, query, resp_hdrs, exp_resp_hdrs=exp_resp_hdrs)
     else:
         return resp, True
 
@@ -414,7 +380,7 @@ def validate_http_anyq_with_allowed_responses(hge_ctx, url, query, headers, exp_
             dict_resp = json.loads(json.dumps(response))
             exp_resp = dict_resp['response']
             exp_resp_hdrs = dict_resp.get('resp_headers')
-            resp_result, pass_test = assert_graphql_resp_expected(resp, exp_resp, query, resp_hdrs, hge_ctx.avoid_err_msg_checks, True, exp_resp_hdrs)
+            resp_result, pass_test = assert_graphql_resp_expected(resp, exp_resp, query, resp_hdrs, True, exp_resp_hdrs)
             if pass_test == True:
                 test_passed = True
                 resp_res = resp_result
@@ -434,15 +400,13 @@ def validate_http_anyq_with_allowed_responses(hge_ctx, url, query, headers, exp_
 #
 # Returns 'resp' and a bool indicating whether the test passed or not (this
 # will always be True unless we are `--accepting`)
-def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs={}, skip_if_err_msg=False, skip_assertion=False, exp_resp_hdrs={}):
-    print('Reponse Headers: ', resp_hdrs)
-    print(exp_resp_hdrs)
-
+def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs={}, skip_assertion=False, exp_resp_hdrs={}):
     # Prepare actual and expected responses so comparison takes into
     # consideration only the ordering that we care about:
     resp         = collapse_order_not_selset(resp_orig,         query)
     exp_response = collapse_order_not_selset(exp_response_orig, query)
-    matched      = equal_CommentedMap(resp, exp_response) and (exp_resp_hdrs or {}).items() <= resp_hdrs.items()
+    hdrs_matched = (exp_resp_hdrs or {}).items() <= resp_hdrs.items()
+    body_matched = equal_CommentedMap(resp, exp_response)
 
     if PytestConf.config.getoption("--accept"):
         print('skipping assertion since we chose to --accept new output')
@@ -470,13 +434,10 @@ def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs=
                 'diff': (stringify_keys(jsondiff.diff(exp_resp_hdrs, diff_hdrs)))
             }
         yml.dump(test_output, stream=dump_str)
-        if not skip_if_err_msg:
-            if skip_assertion:
-                return resp, matched
-            else:
-                assert matched, '\n' + dump_str.getvalue()
-        elif matched:
-            return resp, matched
+        if hdrs_matched and body_matched:
+            return resp, True
+        elif not hdrs_matched:
+            assert False, dump_str.getvalue()
         else:
             def is_err_msg(msg):
                 return any(msg.get(x) for x in ['error','errors'])
@@ -488,13 +449,13 @@ def assert_graphql_resp_expected(resp_orig, exp_response_orig, query, resp_hdrs=
                 if is_err_msg(exp) and is_err_msg(out):
                     if not matched_:
                         warnings.warn("Response does not have the expected error message\n" + dump_str.getvalue())
-                        return resp, matched
+                        return resp, matched_
                 else:
                     if skip_assertion:
                         return resp, matched_
                     else:
                         assert matched_, '\n' + dump_str.getvalue()
-    return resp, matched  # matched always True unless --accept
+    return resp, hdrs_matched and body_matched  # matched always True unless --accept
 
 # This really sucks; newer ruamel made __eq__ ignore ordering:
 #   https://bitbucket.org/ruamel/yaml/issues/326/commentedmap-equality-no-longer-takes-into
@@ -523,33 +484,66 @@ def get_conf_f(f):
         return yaml.YAML().load(c)
 
 def check_query_f(hge_ctx, f, transport='http', add_auth=True, gqlws = False):
-    print("Test file: " + f)
     hge_ctx.may_skip_test_teardown = False
-    print ("transport="+transport)
-    with open(f, 'r+') as c:
-        # For `--accept`:
-        should_write_back = False
+    should_write_back = False
 
+    def add_spec(file, conf):
+        spec = None
+        response = conf.get('response')
+
+        status = conf.get('status')
+        if status is None:
+            status = 200
+
+        query = conf["query"]
+        if "query" in query:
+            query = query["query"]
+
+        headers = conf.get("headers")
+
+        spec = PortToHaskell.PostSpec(
+          conf.get("description"),
+          file,
+          conf["url"],
+          headers,
+          query, # TODO: handle variables
+          status,
+          response)
+
+        PortToHaskell.with_test(hge_ctx.request.cls.__qualname__).add_spec(
+            hge_ctx.request._pyfuncitem.originalname,
+            spec)
+
+    with open(f, 'r+') as c:
         # ruamel will preserve order so that we can test the JSON ordering
         # property conforms to YAML spec.  It also lets us write back the yaml
         # nicely when we `--accept.`
         yml = yaml.YAML()
+
+        # NOTE: preserve ordering with ruamel
         conf = yml.load(c)
+
         if isinstance(conf, list):
             for ix, sconf in enumerate(conf):
-                actual_resp, matched = check_query(hge_ctx, sconf, transport, add_auth, None, gqlws)
-                if PytestConf.config.getoption("--accept") and not matched:
-                    conf[ix]['response'] = actual_resp
-                    should_write_back = True
+              if PytestConf.config.getoption("--port-to-haskell"):
+                  add_spec(f + " [" + str(ix) + "]", sconf)
+              else:
+                  actual_resp, matched = check_query(hge_ctx, sconf, transport, add_auth, gqlws)
+                  if PytestConf.config.getoption("--accept") and not matched:
+                      conf[ix]['response'] = actual_resp
+                      should_write_back = True
         else:
-            if conf['status'] != 200:
-                hge_ctx.may_skip_test_teardown = True
-            actual_resp, matched = check_query(hge_ctx, conf, transport, add_auth, None, gqlws)
-            # If using `--accept` write the file back out with the new expected
-            # response set to the actual response we got:
-            if PytestConf.config.getoption("--accept") and not matched:
-                conf['response'] = actual_resp
-                should_write_back = True
+            if PytestConf.config.getoption("--port-to-haskell"):
+                add_spec(f, conf)
+            else:
+                if conf['status'] != 200:
+                    hge_ctx.may_skip_test_teardown = True
+                actual_resp, matched = check_query(hge_ctx, conf, transport, add_auth, gqlws)
+                # If using `--accept` write the file back out with the new expected
+                # response set to the actual response we got:
+                if PytestConf.config.getoption("--accept") and not matched:
+                    conf['response'] = actual_resp
+                    should_write_back = True
 
         if should_write_back:
             warnings.warn(

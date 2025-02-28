@@ -5,20 +5,81 @@ const path = require('path');
 const lightCodeTheme = require('prism-react-renderer/themes/vsLight');
 const darkCodeTheme = require('prism-react-renderer/themes/dracula');
 
+const DOCS_SERVER_ROOT_URLS = {
+  development: 'localhost:8000',
+  production: 'website-api.hasura.io',
+  staging: 'website-api.stage.hasura.io',
+};
+
+const DOCS_SERVER_URLS = {
+  development: `http://${DOCS_SERVER_ROOT_URLS.development}`,
+  production: `https://${DOCS_SERVER_ROOT_URLS.production}`,
+  staging: `https://${DOCS_SERVER_ROOT_URLS.staging}`,
+};
+
+const BOT_ROUTES = {
+  development: `ws://${DOCS_SERVER_ROOT_URLS.development}/bot/query`,
+  production: `wss://${DOCS_SERVER_ROOT_URLS.production}/docs-services/docs-server/bot/query`,
+  staging: `wss://${DOCS_SERVER_ROOT_URLS.staging}/docs-services/docs-server/bot/query`,
+};
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'Hasura GraphQL Docs',
   tagline: 'Instant GraphQL on all your data',
   url: 'https://hasura.io',
-  baseUrl: '/docs/',
+  baseUrl: process.env.CF_PAGES === '1' ? '/' : '/docs/2.0',
   trailingSlash: true,
   onBrokenLinks: 'throw',
   onBrokenMarkdownLinks: 'throw',
-  favicon: '/docs/img/favicon.png',
+  favicon: '/img/favicon.png',
   organizationName: 'hasura',
   projectName: 'graphql-engine',
   staticDirectories: ['static', 'public'],
-
+  customFields: {
+    docsBotEndpointURL: (() => {
+      if (process.env.CF_PAGES === '1') {
+        return BOT_ROUTES.staging; // if we're on CF pages, use the staging environment
+      } else {
+        const mode = process.env.release_mode;
+        if (mode === 'staging') {
+          return BOT_ROUTES.production; // use production route for staging
+        }
+        return BOT_ROUTES[mode ?? 'development'];
+      }
+    })(),
+    docsServerURL: (() => {
+      if (process.env.CF_PAGES === '1') {
+        return DOCS_SERVER_URLS.staging; // if we're on CF pages, use the staging environment
+      } else {
+        const mode = process.env.release_mode;
+        if (mode === 'staging') {
+          return DOCS_SERVER_URLS.production; // use production route for staging
+        }
+        return DOCS_SERVER_URLS[mode ?? 'development'];
+      }
+    })(),
+    hasuraVersion: 2,
+    DEV_TOKEN: process.env.DEV_TOKEN,
+  },
+  scripts: [],
+  webpack: {
+    jsLoader: isServer => ({
+      loader: require.resolve('swc-loader'),
+      options: {
+        jsc: {
+          parser: {
+            syntax: 'typescript',
+            tsx: true,
+          },
+          target: 'es2017',
+        },
+        module: {
+          type: isServer ? 'commonjs' : 'es6',
+        },
+      },
+    }),
+  },
   presets: [
     [
       'classic',
@@ -38,7 +99,7 @@ const config = {
             current: {
               label: 'v2.x',
               badge: true,
-              path: 'latest',
+              path: '',
             },
           },
         },
@@ -91,8 +152,12 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
-      hideableSidebar: true,
-      autoCollapseSidebarCategories: true,
+      docs: {
+        sidebar: {
+          hideable: true,
+          autoCollapseCategories: true,
+        },
+      },
       colorMode: {
         defaultMode: 'light',
         disableSwitch: false,
@@ -117,10 +182,13 @@ const config = {
         // Optional: Algolia search parameters
         // searchParameters: {},
       },
-      // announcementBar: {
-      //   id: 'announcementBar-3', // Increment on change
-      //   content: `⭐️ If you like Docusaurus, give it a star on <a target="_blank" rel="noopener noreferrer" href="https://github.com/facebook/docusaurus">GitHub</a> and follow us on <a target="_blank" rel="noopener noreferrer" href="https://twitter.com/docusaurus" >Twitter</a> ${TwitterSvg}`,
-      // },
+      announcementBar: {
+        id: 'announcementBar-1', // Increment on change
+        content: `The new version of Hasura has launched. <a target="_blank" rel="noopener" href="https://hasura.io/docs/3.0/getting-started/quickstart/?utm_source=hasura&utm_medium=v2_docs">Get started with Hasura DDN here.</a>`,
+        isCloseable: false,
+        // backgroundColor: '#478BCA',
+        // textColor: '#091E42',
+      },
       // announcementBar: {
       //   id: 'announcement-bar-3',
       //   content:
@@ -154,10 +222,32 @@ const config = {
             position: 'left',
           },
           {
+            to: 'https://hasura.io/changelog',
+            label: "What's New",
+            id: 'whats-new-link',
+            position: 'left',
+          },
+          {
+            to: '/hasura-cloud/overview',
+            label: 'Hasura Cloud',
+            className: 'header-hasura-cloud-link',
+            position: 'left',
+          },
+          {
+            to: '/enterprise/overview',
+            label: 'Hasura Enterprise',
+            className: 'header-hasura-ee-link',
+            position: 'left',
+          },
+          {
             type: 'docsVersionDropdown',
             position: 'right',
             dropdownActiveClassDisabled: true,
             dropdownItemsAfter: [
+              {
+                href: 'https://hasura.io/docs/3.0/index/',
+                label: 'v3.x (DDN)',
+              },
               {
                 href: 'https://hasura.io/docs/1.0/graphql/core/index.html',
                 label: 'v1.x',
@@ -186,7 +276,7 @@ const config = {
             className: 'nav-link_login',
           },
           {
-            to: 'https://cloud.hasura.io/signup?pg=products&plcmt=header&cta=try-hasura&tech=default',
+            to: 'https://cloud.hasura.io/signup?pg=products&plcmt=header&cta=get_started&tech=default',
             label: 'Get Started',
             position: 'right',
             className: 'nav-link_getting-started',

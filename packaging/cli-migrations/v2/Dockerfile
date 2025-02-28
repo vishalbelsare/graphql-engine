@@ -1,10 +1,5 @@
 ARG BASE_IMAGE
-
 FROM ${BASE_IMAGE}
-
-# yum update uses --nobest option to tackle https://github.com/hasura/graphql-engine-mono/issues/4096
-RUN { apt-get update && apt-get install -y netcat; } \
-  || { yum update -y --nobest && yum install -y nc; }
 
 # When a non-root user without home directory is trying to use the cli-migrations image
 # then hasura cli will try to create .hasura folder at the root but would fail due to permissions
@@ -19,15 +14,14 @@ RUN mkdir -p /.hasura \
 ENV HASURA_GRAPHQL_SHOW_UPDATE_NOTIFICATION=false
 
 COPY docker-entrypoint.sh /bin/
-COPY hasura-cli /bin/hasura-cli
-
-RUN chmod +x /bin/hasura-cli
+COPY --chmod=+x hasura-cli /bin/hasura-cli
 
 # set an env var to let the cli know that
 # it is running in server environment
 ENV HASURA_GRAPHQL_CLI_ENVIRONMENT=server-on-docker
-ENV HGE_BINARY="graphql-engine"
+ARG HGE_BINARY
+ENV HGE_BINARY=${HGE_BINARY}
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-CMD ["graphql-engine", "serve"]
+CMD $HGE_BINARY serve
